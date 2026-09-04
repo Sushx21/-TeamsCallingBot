@@ -847,51 +847,78 @@ namespace TeamsCallingBot.Bot
         /// <summary>
         /// Posts an activity to a Teams conversation via the official Bot Framework Connector API.
         /// Standard for Teams bots, requires NO Microsoft Graph ChatMessage.Send.* permissions.
+        /// The activity MUST include from, conversation, channelId, and serviceUrl fields or Teams will reject it.
         /// </summary>
         public async Task<bool> PostActivityViaBotFrameworkAsync(string threadId, string text)
         {
             string bfToken = await GetBotFrameworkTokenAsync().ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(bfToken))
             {
+                this.graphLogger.Warn("[BotFramework Connector] Could not acquire Bot Framework token.");
                 return false;
             }
 
-            var endpoints = new[]
+            string botAppId = BotOptions.Current?.AadAppId ?? string.Empty;
+            string tenantId = BotOptions.Current?.AadTenantId ?? string.Empty;
+
+            // Try multiple SMBA regional endpoints.
+            // IMPORTANT: Do NOT Uri.EscapeDataString the threadId - it must be passed verbatim
+            // (Teams thread IDs like "19:meeting_xxx@thread.v2" are already valid path segments).
+            var serviceUrls = new[]
             {
-                $"https://smba.trafficmanager.net/apis/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
-                $"https://smba.trafficmanager.net/amer/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
-                $"https://smba.trafficmanager.net/apac/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
-                $"https://smba.trafficmanager.net/emea/v3/conversations/{Uri.EscapeDataString(threadId)}/activities"
+                "https://smba.trafficmanager.net/apis/",
+                "https://smba.trafficmanager.net/amer/",
+                "https://smba.trafficmanager.net/apac/",
+                "https://smba.trafficmanager.net/emea/"
             };
 
-            var activity = new
+            // Full Bot Framework activity - 'from', 'conversation', 'channelId', 'serviceUrl' are required.
+            foreach (var serviceUrl in serviceUrls)
             {
-                type = "message",
-                text = text,
-                textFormat = "markdown"
-            };
+                string url = $"{serviceUrl}v3/conversations/{threadId}/activities";
+                var activity = new
+                {
+                    type = "message",
+                    text = text,
+                    textFormat = "markdown",
+                    channelId = "msteams",
+                    serviceUrl = serviceUrl,
+                    from = new { id = botAppId, name = "TDA Bot" },
+                    conversation = new { id = threadId, isGroup = true, tenantId = tenantId },
+                    channelData = new { tenant = new { id = tenantId } }
+                };
 
-            string jsonPayload = JsonConvert.SerializeObject(activity);
+                string jsonPayload = JsonConvert.SerializeObject(activity);
 
-            foreach (var url in endpoints)
-            {
                 try
                 {
                     using (var client = new HttpClient())
                     {
                         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bfToken);
-                        var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-                        var resp = await client.PostAsync(url, content).ConfigureAwait(false);
+                        var reqContent = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                        var resp = await client.PostAsync(url, reqContent).ConfigureAwait(false);
 
                         if (resp.IsSuccessStatusCode)
                         {
-                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted message to meeting chat!");
-                            Console.WriteLine($">>> [BotFramework Connector] Successfully posted message to meeting chat!");
+                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted to {serviceUrl}");
+                            Console.WriteLine($">>> [BotFramework Connector] Message sent successfully via {serviceUrl}");
                             return true;
+                        }
+                        else
+                        {
+                            string errBody = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                            this.graphLogger.Warn($"[BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
+                            Console.WriteLine($">>> [BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
+
+                            // If 401 on first attempt, the token is invalid — bail immediately.
+                            if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized) return false;
                         }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Warn($"[BotFramework Connector] Exception on {serviceUrl}: {ex.Message}");
+                }
             }
 
             return false;
@@ -996,125 +1023,83 @@ namespace TeamsCallingBot.Bot
         }
 
         /// <summary>
-        /// Periodically monitors the Teams meeting group chat for mentions/prompts like "tda bot", "hi", "kaise ho",
-        /// replies directly in the group chat, and speaks the answer into the meeting call.
+        /// Initializes the CTS for chat monitoring. Actual incoming chat messages are received
+        /// via the Bot Framework /api/messages endpoint (BotMessagingController) and routed to
+        /// HandleIncomingChatActivity() below. This avoids needing Chat.Read.All Graph permissions.
         /// </summary>
         private void StartMeetingChatMonitor()
         {
             this.chatMonitorCts = new CancellationTokenSource();
-            var token = this.chatMonitorCts.Token;
+            string threadId = this.GetEffectiveChatThreadId();
+            Console.WriteLine($">>> [Chat Monitor] Initialized. Meeting chat thread: {threadId ?? "(not yet known - will be set from call.Resource.ChatInfo)"}. Listening via /api/messages.");
+        }
 
-            _ = Task.Run(async () =>
+        /// <summary>
+        /// Called by BotMessagingController when Teams delivers an incoming chat message activity
+        /// to /api/messages. Replies both in chat and via voice.
+        /// </summary>
+        public void HandleIncomingChatActivity(string fromUserName, string fromUserId, string messageText, string incomingServiceUrl)
+        {
+            if (string.IsNullOrWhiteSpace(messageText)) return;
+
+            string lower = messageText.ToLowerInvariant();
+
+            // Only respond to messages that mention/address the bot
+            bool isBotMention = lower.Contains("tda") || lower.Contains("bot") ||
+                                 lower.Contains("kaise ho") || lower.Contains("kaisa") ||
+                                 lower.Contains("hi") || lower.Contains("hello") ||
+                                 lower.Contains("hey") || lower.Contains("help") ||
+                                 lower.Contains("status") || lower.Contains("recording");
+
+            if (!isBotMention) return;
+
+            this.graphLogger.Info($"[Chat Monitor] Incoming message from {fromUserName}: \"{messageText}\"");
+            Console.WriteLine($">>> [Chat Monitor] Incoming message from {fromUserName}: \"{messageText}\"");
+
+            string chatReply;
+            string voiceReply;
+
+            if (lower.Contains("kaise ho") || lower.Contains("kaisa"))
             {
-                // Let call settle for a couple seconds before polling
-                await Task.Delay(3000, token).ConfigureAwait(false);
-                bool loggedPermissionNotice = false;
+                chatReply = $"Hello {fromUserName}! 🙏 Main badhiya hoon (I'm doing well!). Main TDA Bot hoon, aapka meeting assistant. Kya madad kar sakta hoon?";
+                voiceReply = $"Hello {fromUserName}! Main badhiya hoon. I am TDA Bot. How can I help you today?";
+            }
+            else if (lower.Contains("status") || lower.Contains("recording"))
+            {
+                chatReply = $"📊 **TDA Bot Status:** \n• 🎙️ Audio recording: Active\n• 📺 Screen share capture: Active\n• 🤖 AI assistant: Listening\n\nMeeting session is being recorded and transcribed.";
+                voiceReply = "TDA Bot is active. I am recording meeting audio and capturing screen shares.";
+            }
+            else if (lower.Contains("help"))
+            {
+                chatReply = $"Hi {fromUserName}! 👋 I'm **TDA Bot**. I can:\n• 🎙️ Record meeting audio\n• 📺 Capture screen shares\n• 💬 Reply to your messages\n\nJust type **tda bot** or **hi bot** to talk to me!";
+                voiceReply = $"Hello {fromUserName}! I am TDA Bot. I am recording the meeting and can assist you.";
+            }
+            else
+            {
+                chatReply = $"Hello {fromUserName}! 👋 I'm **TDA Bot**, your AI meeting assistant. I'm actively listening and recording this meeting. Type **tda bot status** to check my status.";
+                voiceReply = $"Hello {fromUserName}! I am TDA Bot, your meeting assistant. How can I assist you?";
+            }
 
-                while (!token.IsCancellationRequested)
+            // If we got a serviceUrl from the incoming message, use it for the reply (most reliable)
+            string effectiveThreadId = this.GetEffectiveChatThreadId();
+            if (!string.IsNullOrWhiteSpace(effectiveThreadId))
+            {
+                _ = Task.Run(async () =>
                 {
-                    try
+                    bool sent = await this.PostActivityViaBotFrameworkAsync(effectiveThreadId, chatReply).ConfigureAwait(false);
+                    if (!sent)
                     {
-                        string threadId = this.GetEffectiveChatThreadId();
-                        string tokenStr = this.GetEffectiveAccessToken();
-
-                        if (!string.IsNullOrWhiteSpace(threadId) && !string.IsNullOrWhiteSpace(tokenStr))
-                        {
-                            string endpoint = $"https://graph.microsoft.com/v1.0/chats/{threadId}/messages?$top=10";
-
-                            using (var client = new HttpClient())
-                            {
-                                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tokenStr);
-                                var response = await client.GetAsync(endpoint, token).ConfigureAwait(false);
-
-                                if (response.IsSuccessStatusCode)
-                                {
-                                    var json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                                    var jobj = JObject.Parse(json);
-                                    var messages = jobj["value"] as JArray;
-
-                                    if (messages != null && messages.Count > 0)
-                                    {
-                                        foreach (var msg in messages)
-                                        {
-                                            string id = msg["id"]?.ToString();
-                                            if (string.IsNullOrWhiteSpace(id)) continue;
-
-                                            // Ignore if already processed
-                                            if (this.processedChatMsgIds.Contains(id)) continue;
-                                            this.processedChatMsgIds.Add(id);
-
-                                            var fromObj = msg["from"];
-                                            string fromAppId = fromObj?["application"]?["id"]?.ToString();
-                                            string fromUserName = fromObj?["user"]?["displayName"]?.ToString() ?? "Participant";
-
-                                            // Skip messages generated by the bot itself
-                                            if (!string.IsNullOrWhiteSpace(fromAppId) &&
-                                                string.Equals(fromAppId, BotOptions.Current?.AadAppId, StringComparison.OrdinalIgnoreCase))
-                                            {
-                                                continue;
-                                            }
-
-                                            string bodyContent = msg["body"]?["content"]?.ToString() ?? "";
-                                            string plainText = System.Text.RegularExpressions.Regex.Replace(bodyContent, "<.*?>", string.Empty).Trim();
-
-                                            if (string.IsNullOrWhiteSpace(plainText)) continue;
-
-                                            this.graphLogger.Info($"[Chat Monitor] New message from {fromUserName}: \"{plainText}\"");
-                                            Console.WriteLine($">>> [Chat Monitor] New message from {fromUserName}: \"{plainText}\"");
-
-                                            string lower = plainText.ToLowerInvariant();
-                                            if (lower.Contains("tda") || lower.Contains("bot") || lower.Contains("kaise ho") ||
-                                                lower.Contains("hi") || lower.Contains("hello") || lower.Contains("hey") ||
-                                                lower.Contains("help") || lower.Contains("status"))
-                                            {
-                                                string chatReply;
-                                                string voiceReply;
-
-                                                if (lower.Contains("kaise ho"))
-                                                {
-                                                    chatReply = $"Hello {fromUserName}! 🙏 Main badhiya hoon (I'm doing well!). I am TDA Bot, your meeting assistant. How can I help you?";
-                                                    voiceReply = $"Hello {fromUserName}! Main badhiya hoon. I am doing well. How can I help you today?";
-                                                }
-                                                else if (lower.Contains("status") || lower.Contains("recording"))
-                                                {
-                                                    chatReply = $"📊 <b>TDA Bot Status:</b> Recording meeting audio, capturing screen shares, and actively listening to this session.";
-                                                    voiceReply = "TDA Bot is active, recording meeting audio, and capturing screen shares.";
-                                                }
-                                                else
-                                                {
-                                                    chatReply = $"Hello {fromUserName}! 👋 I am TDA Bot, your AI meeting assistant. I am actively listening and recording this meeting.";
-                                                    voiceReply = $"Hello {fromUserName}! I am TDA Bot, your meeting assistant. How can I assist you?";
-                                                }
-
-                                                // 1. Post reply to meeting chat
-                                                _ = this.PostTextMessageToChatAsync(chatReply);
-
-                                                // 2. Speak response aloud into meeting
-                                                if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
-                                                {
-                                                    _ = this.AudioSender.SpeakAsync(voiceReply);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                else if (response.StatusCode == System.Net.HttpStatusCode.Forbidden && !loggedPermissionNotice)
-                                {
-                                    loggedPermissionNotice = true;
-                                    Console.WriteLine(">>> [Chat Monitor] Note: Reading chat messages returned 403 Forbidden. Grant 'Chat.ReadWrite.All' or 'Chat.Read.All' Application permission in Azure Portal to enable chat replies.");
-                                }
-                            }
-                        }
+                        // Fallback to Graph if BF fails
+                        await this.PostTextMessageToChatAsync(chatReply).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) { break; }
-                    catch (Exception ex)
-                    {
-                        this.graphLogger.Warn($"[Chat Monitor] Polling error: {ex.Message}");
-                    }
+                });
+            }
 
-                    await Task.Delay(3000, token).ConfigureAwait(false);
-                }
-            }, token);
+            // Speak response aloud into meeting
+            if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
+            {
+                _ = this.AudioSender.SpeakAsync(voiceReply);
+            }
         }
 
         // ===================================================================
