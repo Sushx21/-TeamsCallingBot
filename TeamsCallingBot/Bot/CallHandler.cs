@@ -781,8 +781,125 @@ namespace TeamsCallingBot.Bot
             return BotOptions.Current?.OverrideBearerToken;
         }
 
+        private static string cachedBfToken = null;
+        private static DateTime bfTokenExpiry = DateTime.MinValue;
+        private static readonly object bfTokenLock = new object();
+
+        /// <summary>
+        /// Acquires a Bot Framework OAuth token using app credentials (audience: https://api.botframework.com).
+        /// This bypasses Microsoft Graph's ChatMessage.Send permission requirements completely!
+        /// </summary>
+        public static async Task<string> GetBotFrameworkTokenAsync()
+        {
+            lock (bfTokenLock)
+            {
+                if (!string.IsNullOrWhiteSpace(cachedBfToken) && DateTime.UtcNow < bfTokenExpiry)
+                {
+                    return cachedBfToken;
+                }
+            }
+
+            try
+            {
+                string appId = BotOptions.Current?.AadAppId;
+                string appSecret = BotOptions.Current?.AadAppSecretOrCertThumbprint;
+                string tenantId = BotOptions.Current?.AadTenantId ?? "common";
+
+                if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
+                {
+                    return null;
+                }
+
+                using (var client = new HttpClient())
+                {
+                    var pairs = new List<KeyValuePair<string, string>>
+                    {
+                        new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                        new KeyValuePair<string, string>("client_id", appId),
+                        new KeyValuePair<string, string>("client_secret", appSecret),
+                        new KeyValuePair<string, string>("scope", "https://api.botframework.com/.default")
+                    };
+
+                    var content = new FormUrlEncodedContent(pairs);
+                    var resp = await client.PostAsync($"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token", content).ConfigureAwait(false);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        var jobj = JObject.Parse(json);
+                        string token = jobj["access_token"]?.ToString();
+                        int expiresIn = jobj["expires_in"]?.Value<int>() ?? 3600;
+
+                        lock (bfTokenLock)
+                        {
+                            cachedBfToken = token;
+                            bfTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+                        }
+
+                        return token;
+                    }
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Posts an activity to a Teams conversation via the official Bot Framework Connector API.
+        /// Standard for Teams bots, requires NO Microsoft Graph ChatMessage.Send.* permissions.
+        /// </summary>
+        public async Task<bool> PostActivityViaBotFrameworkAsync(string threadId, string text)
+        {
+            string bfToken = await GetBotFrameworkTokenAsync().ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(bfToken))
+            {
+                return false;
+            }
+
+            var endpoints = new[]
+            {
+                $"https://smba.trafficmanager.net/apis/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
+                $"https://smba.trafficmanager.net/amer/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
+                $"https://smba.trafficmanager.net/apac/v3/conversations/{Uri.EscapeDataString(threadId)}/activities",
+                $"https://smba.trafficmanager.net/emea/v3/conversations/{Uri.EscapeDataString(threadId)}/activities"
+            };
+
+            var activity = new
+            {
+                type = "message",
+                text = text,
+                textFormat = "markdown"
+            };
+
+            string jsonPayload = JsonConvert.SerializeObject(activity);
+
+            foreach (var url in endpoints)
+            {
+                try
+                {
+                    using (var client = new HttpClient())
+                    {
+                        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bfToken);
+                        var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                        var resp = await client.PostAsync(url, content).ConfigureAwait(false);
+
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted message to meeting chat!");
+                            Console.WriteLine($">>> [BotFramework Connector] Successfully posted message to meeting chat!");
+                            return true;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
         /// <summary>
         /// Posts a formatted text/HTML message into the Teams meeting group chat.
+        /// Tries Bot Framework Connector API first (no Graph permission needed), then falls back to Graph.
         /// </summary>
         public async Task<bool> PostTextMessageToChatAsync(string htmlContent, bool isRemovalNotification = false)
         {
@@ -793,6 +910,22 @@ namespace TeamsCallingBot.Bot
                 return false;
             }
 
+            // 1. PRIMARY: Bot Framework Connector API (official bot messaging, no Graph admin consent needed)
+            string markdownText = htmlContent
+                .Replace("<b>", "**").Replace("</b>", "**")
+                .Replace("<i>", "*").Replace("</i>", "*");
+
+            bool bfSuccess = await this.PostActivityViaBotFrameworkAsync(threadId, markdownText).ConfigureAwait(false);
+            if (bfSuccess)
+            {
+                if (isRemovalNotification)
+                {
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, true);
+                }
+                return true;
+            }
+
+            // 2. FALLBACK: Microsoft Graph Chat API
             string token = this.GetEffectiveAccessToken();
             if (string.IsNullOrWhiteSpace(token))
             {
