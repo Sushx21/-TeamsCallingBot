@@ -187,6 +187,12 @@ namespace TeamsCallingBot.Bot
             // 5. Start Active Meeting Chat Monitor (replies to "tda bot", "hi", "kaise ho" in group chat + voice)
             this.StartMeetingChatMonitor();
 
+            // Diagnostic: log what auth credentials are available for chat posting
+            string diagAppId = BotOptions.Current?.AadAppId ?? "(null)";
+            string diagSecret = string.IsNullOrWhiteSpace(BotOptions.Current?.AadAppSecretOrCertThumbprint) ? "(empty)" : $"({BotOptions.Current.AadAppSecretOrCertThumbprint.Length} chars)";
+            string diagOverride = string.IsNullOrWhiteSpace(BotOptions.Current?.OverrideBearerToken) ? "(empty)" : $"({BotOptions.Current.OverrideBearerToken.Length} chars)";
+            Console.WriteLine($">>> [Config Diagnostic] AppId={diagAppId}, Secret={diagSecret}, OverrideToken={diagOverride}");
+
             this.graphLogger.Info($"CallHandler initialized for {this.Call.Id}. Output folder: {this.RecordingsManager.SessionDirectory}");
             Console.WriteLine($">>> [CallHandler] Output folder: {this.RecordingsManager.SessionDirectory}");
         }
@@ -466,6 +472,12 @@ namespace TeamsCallingBot.Bot
                 uint timestamp = 0;
                 int tick = 0;
                 bool snapshotSaved = false;
+                bool loggedFirstSend = false;
+                bool loggedFirstError = false;
+                int consecutiveErrors = 0;
+
+                // Wait for call to be established before sending frames
+                await Task.Delay(2000, token).ConfigureAwait(false);
 
                 try
                 {
@@ -488,17 +500,19 @@ namespace TeamsCallingBot.Bot
                                 this.RecordingsManager.SavePhoto(card, "05_bot_broadcast_preview");
                             }
 
-                            // Only send NV12 frames when the socket send status is Active!
-                            if (this.isVideoSendActive)
+                            if (this.isKeyFrameNeeded)
                             {
-                                if (this.isKeyFrameNeeded)
-                                {
-                                    this.isKeyFrameNeeded = false;
-                                }
-                                byte[] nv12Bytes = VideoFrameConverter.ConvertBitmapToNV12(card, width, height);
+                                this.isKeyFrameNeeded = false;
+                            }
 
-                                // Use safe VideoSendBuffer constructor that manages its own unmanaged buffer
-                                // and frees upon Dispose() - completely eliminating double free!
+                            byte[] nv12Bytes = VideoFrameConverter.ConvertBitmapToNV12(card, width, height);
+
+                            // CRITICAL FIX: Send frames unconditionally.
+                            // The isVideoSendActive event may never fire on some MediaPlatform builds,
+                            // preventing the bot from ever becoming visible. Sending when the socket
+                            // isn't ready throws an exception, which we catch and retry next tick.
+                            try
+                            {
                                 using (var videoBuffer = new VideoSendBuffer(
                                     nv12Bytes,
                                     (uint)nv12Bytes.Length,
@@ -506,6 +520,28 @@ namespace TeamsCallingBot.Bot
                                     (long)timestamp))
                                 {
                                     this.videoSocket.Send(videoBuffer);
+                                }
+
+                                consecutiveErrors = 0;
+                                if (!loggedFirstSend)
+                                {
+                                    loggedFirstSend = true;
+                                    Console.WriteLine($">>> [Bot Video] First frame sent successfully at tick {tick}! Bot should now be visible.");
+                                    this.graphLogger.Info($"[Bot Video] First frame sent successfully at tick {tick}.");
+                                }
+                            }
+                            catch (Exception sendEx)
+                            {
+                                consecutiveErrors++;
+                                if (!loggedFirstError)
+                                {
+                                    loggedFirstError = true;
+                                    Console.WriteLine($">>> [Bot Video] Send attempt failed (will keep retrying): {sendEx.GetType().Name}: {sendEx.Message}");
+                                }
+                                // After initial errors, slow down to avoid spamming
+                                if (consecutiveErrors > 30 && consecutiveErrors % 100 == 0)
+                                {
+                                    Console.WriteLine($">>> [Bot Video] Still retrying... ({consecutiveErrors} consecutive send failures, isVideoSendActive={this.isVideoSendActive})");
                                 }
                             }
                         }
@@ -518,6 +554,7 @@ namespace TeamsCallingBot.Bot
                 catch (Exception ex)
                 {
                     this.graphLogger.Error(ex, "Error in bot video broadcast loop.");
+                    Console.WriteLine($">>> [Bot Video] FATAL broadcast loop error: {ex.Message}");
                 }
             }, token);
 
@@ -799,16 +836,19 @@ namespace TeamsCallingBot.Bot
                 }
             }
 
+            string appId = BotOptions.Current?.AadAppId;
+            string appSecret = BotOptions.Current?.AadAppSecretOrCertThumbprint;
+            string tenantId = BotOptions.Current?.AadTenantId ?? "common";
+
+            if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
+            {
+                Console.WriteLine($">>> [BF Token] CANNOT acquire token: AppId={(string.IsNullOrWhiteSpace(appId) ? "MISSING" : "OK")}, Secret={(string.IsNullOrWhiteSpace(appSecret) ? "MISSING" : "OK")}");
+                return null;
+            }
+
             try
             {
-                string appId = BotOptions.Current?.AadAppId;
-                string appSecret = BotOptions.Current?.AadAppSecretOrCertThumbprint;
-                string tenantId = BotOptions.Current?.AadTenantId ?? "common";
-
-                if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
-                {
-                    return null;
-                }
+                Console.WriteLine($">>> [BF Token] Requesting token from login.microsoftonline.com/{tenantId} for api.botframework.com...");
 
                 using (var client = new HttpClient())
                 {
@@ -822,9 +862,10 @@ namespace TeamsCallingBot.Bot
 
                     var content = new FormUrlEncodedContent(pairs);
                     var resp = await client.PostAsync($"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token", content).ConfigureAwait(false);
+                    var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
                     if (resp.IsSuccessStatusCode)
                     {
-                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                         var jobj = JObject.Parse(json);
                         string token = jobj["access_token"]?.ToString();
                         int expiresIn = jobj["expires_in"]?.Value<int>() ?? 3600;
@@ -835,11 +876,19 @@ namespace TeamsCallingBot.Bot
                             bfTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
                         }
 
+                        Console.WriteLine($">>> [BF Token] SUCCESS - token acquired, expires in {expiresIn}s");
                         return token;
+                    }
+                    else
+                    {
+                        Console.WriteLine($">>> [BF Token] FAILED ({(int)resp.StatusCode}): {json}");
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($">>> [BF Token] EXCEPTION: {ex.GetType().Name}: {ex.Message}");
+            }
 
             return null;
         }
