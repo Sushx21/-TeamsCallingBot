@@ -120,6 +120,8 @@ namespace TeamsCallingBot.Audio
             uint timestamp = 0;
             int offset = 0;
             var frameBuffer = new byte[BytesPerFrame];
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            long targetElapsedMs = 0;
 
             try
             {
@@ -159,8 +161,22 @@ namespace TeamsCallingBot.Audio
 
                     offset += BytesPerFrame;
                     timestamp += FrameDurationMs;
+                    targetElapsedMs += FrameDurationMs;
 
-                    await Task.Delay(FrameDurationMs, token).ConfigureAwait(false);
+                    // Drift-compensated pacing: ensure exactly 20ms of audio per 20ms real time
+                    long currentElapsedMs = stopwatch.ElapsedMilliseconds;
+                    int waitMs = (int)(targetElapsedMs - currentElapsedMs);
+                    if (waitMs > 1)
+                    {
+                        if (waitMs > 15)
+                        {
+                            await Task.Delay(waitMs - 8, token).ConfigureAwait(false);
+                        }
+                        while (stopwatch.ElapsedMilliseconds < targetElapsedMs && !token.IsCancellationRequested)
+                        {
+                            Thread.SpinWait(100);
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -218,6 +234,7 @@ namespace TeamsCallingBot.Audio
                 using (var synth = new System.Speech.Synthesis.SpeechSynthesizer())
                 using (var ms = new MemoryStream())
                 {
+                    synth.Rate = 1; // Natural, clear conversational tempo (default 0 is too slow)
                     var format = new System.Speech.AudioFormat.SpeechAudioFormatInfo(SampleRate, System.Speech.AudioFormat.AudioBitsPerSample.Sixteen, System.Speech.AudioFormat.AudioChannel.Mono);
                     synth.SetOutputToAudioStream(ms, format);
                     synth.Speak(text);

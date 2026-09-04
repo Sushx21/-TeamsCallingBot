@@ -18,6 +18,7 @@ namespace TeamsCallingBot.Bot
     using Microsoft.Graph.Communications.Resources;
     using Microsoft.Skype.Bots.Media;
     using Newtonsoft.Json;
+    using Newtonsoft.Json.Linq;
     using TeamsCallingBot.Audio;
     using TeamsCallingBot.Common;
     using TeamsCallingBot.Config;
@@ -56,11 +57,16 @@ namespace TeamsCallingBot.Bot
         private volatile bool isKeyFrameNeeded = true;
         private int joinWelcomeSent = 0;
 
-        // Screen Capture Throttling (e.g. 1 photo every 5 seconds)
-        private DateTime lastPhotoTime = DateTime.MinValue;
+        // Screen & Video Capture Throttling (independent throttles so screen capture isn't starved)
+        private DateTime lastVbssPhotoTime = DateTime.MinValue;
+        private DateTime lastVideoPhotoTime = DateTime.MinValue;
         private readonly TimeSpan photoInterval = TimeSpan.FromSeconds(5);
         private readonly object photoLock = new object();
         private Bitmap latestScreenBitmap = null;
+
+        // Meeting Chat Polling & Dynamic Conversational Reply Loop
+        private CancellationTokenSource chatMonitorCts;
+        private readonly HashSet<string> processedChatMsgIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Bot Video Streaming
         private CancellationTokenSource videoBroadcastCts;
@@ -178,6 +184,9 @@ namespace TeamsCallingBot.Bot
                 }
             }, this.periodicFlushCts.Token);
 
+            // 5. Start Active Meeting Chat Monitor (replies to "tda bot", "hi", "kaise ho" in group chat + voice)
+            this.StartMeetingChatMonitor();
+
             this.graphLogger.Info($"CallHandler initialized for {this.Call.Id}. Output folder: {this.RecordingsManager.SessionDirectory}");
             Console.WriteLine($">>> [CallHandler] Output folder: {this.RecordingsManager.SessionDirectory}");
         }
@@ -294,9 +303,9 @@ namespace TeamsCallingBot.Bot
 
                 lock (this.photoLock)
                 {
-                    if (now - this.lastPhotoTime >= this.photoInterval)
+                    if (now - this.lastVbssPhotoTime >= this.photoInterval)
                     {
-                        this.lastPhotoTime = now;
+                        this.lastVbssPhotoTime = now;
                         shouldCapture = true;
                     }
                 }
@@ -366,9 +375,9 @@ namespace TeamsCallingBot.Bot
 
                 lock (this.photoLock)
                 {
-                    if (now - this.lastPhotoTime >= this.photoInterval)
+                    if (now - this.lastVideoPhotoTime >= this.photoInterval)
                     {
-                        this.lastPhotoTime = now;
+                        this.lastVideoPhotoTime = now;
                         shouldCapture = true;
                     }
                 }
@@ -605,6 +614,14 @@ namespace TeamsCallingBot.Bot
                             string label = stream.Label ?? "";
                             string mediaTypeStr = stream.MediaType.ToString();
 
+                            // CRITICAL FIX: Only subscribe to a participant MSI if the stream is actively sending!
+                            // If stream.Direction is Inactive or ReceiveOnly, subscribing to it will overwrite and break the active stream!
+                            bool isSending = stream.Direction == MediaDirection.SendOnly || stream.Direction == MediaDirection.SendReceive;
+                            if (!isSending)
+                            {
+                                continue;
+                            }
+
                             // 1. Screen sharing stream (VBSS)
                             if (mediaTypeStr.IndexOf("ScreenSharing", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 label.IndexOf("sharing", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -612,8 +629,8 @@ namespace TeamsCallingBot.Bot
                                 try
                                 {
                                     this.vbssSocket?.Subscribe(VideoResolution.HD1080p, msi);
-                                    this.graphLogger.Info($"[VBSS Socket] Subscribed to screen share MSI {msi} ({label}) for {participant.Id}");
-                                    Console.WriteLine($">>> [VBSS Socket] Subscribed to screen share MSI {msi} ({label})");
+                                    this.graphLogger.Info($"[VBSS Socket] Subscribed to active screen share MSI {msi} ({label}) for {participant.Id}");
+                                    Console.WriteLine($">>> [VBSS Socket] Subscribed to active screen share MSI {msi} ({label})");
                                 }
                                 catch (Exception ex)
                                 {
@@ -686,12 +703,12 @@ namespace TeamsCallingBot.Bot
                 return;
             }
 
-            // Check if removed by user / organizer (subcodes 7002, 702, 403, or keyword messages)
+            // Check if removed by user / organizer (subcodes 7002, 702, 5000, 403, or keyword messages)
             bool wasRemovedByUser = false;
             if (resultInfo != null)
             {
                 string msg = resultInfo.Message?.ToLowerInvariant() ?? "";
-                if (resultInfo.Subcode == 7002 || resultInfo.Subcode == 702 || resultInfo.Code == 403 ||
+                if (resultInfo.Subcode == 7002 || resultInfo.Subcode == 702 || resultInfo.Subcode == 5000 || resultInfo.Code == 403 ||
                     msg.Contains("removed") || msg.Contains("kicked") || msg.Contains("ejected") || msg.Contains("organizer"))
                 {
                     wasRemovedByUser = true;
@@ -700,7 +717,7 @@ namespace TeamsCallingBot.Bot
 
             if (wasRemovedByUser)
             {
-                Console.WriteLine(">>> BOT REMOVAL DETECTED: Announcing and posting notification message...");
+                Console.WriteLine(">>> BOT REMOVAL DETECTED: Announcing verbally and posting notification to group chat...");
                 _ = Task.Run(async () =>
                 {
                     try
@@ -717,6 +734,13 @@ namespace TeamsCallingBot.Bot
                     "⚠️ <b>Teams Calling Bot Notification:</b> The bot was removed from this meeting by a participant or organizer.",
                     isRemovalNotification: true));
             }
+            else
+            {
+                Console.WriteLine(">>> CALL TERMINATION / BOT LEAVING: Posting group chat departure notification...");
+                _ = Task.Run(() => this.PostTextMessageToChatAsync(
+                    "👋 <b>Teams Calling Bot Notification:</b> The bot has left the meeting. All session audio, screen captures, and transcripts have been archived.",
+                    isRemovalNotification: true));
+            }
 
             _ = this.HandleCallEndedAsync().ContinueWith(t =>
             {
@@ -727,36 +751,62 @@ namespace TeamsCallingBot.Bot
             });
         }
 
+        public string GetEffectiveChatThreadId()
+        {
+            if (!string.IsNullOrWhiteSpace(this.chatThreadId))
+            {
+                return this.chatThreadId;
+            }
+
+            try
+            {
+                var threadId = this.Call.Resource?.ChatInfo?.ThreadId;
+                if (!string.IsNullOrWhiteSpace(threadId))
+                {
+                    return threadId;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        public string GetEffectiveAccessToken()
+        {
+            if (!string.IsNullOrWhiteSpace(this.botAccessToken))
+            {
+                return this.botAccessToken;
+            }
+
+            return BotOptions.Current?.OverrideBearerToken;
+        }
+
         /// <summary>
         /// Posts a formatted text/HTML message into the Teams meeting group chat.
         /// </summary>
         public async Task<bool> PostTextMessageToChatAsync(string htmlContent, bool isRemovalNotification = false)
         {
-            if (string.IsNullOrWhiteSpace(this.chatThreadId))
+            string threadId = this.GetEffectiveChatThreadId();
+            if (string.IsNullOrWhiteSpace(threadId))
             {
                 this.graphLogger.Warn("[Chat Notification] Missing chatThreadId - cannot post message.");
                 return false;
             }
 
-            string token = this.botAccessToken;
-            if (string.IsNullOrWhiteSpace(token))
-            {
-                token = BotOptions.Current?.OverrideBearerToken;
-            }
-
+            string token = this.GetEffectiveAccessToken();
             if (string.IsNullOrWhiteSpace(token))
             {
                 this.graphLogger.Warn("[Chat Notification] No access token available to post chat message.");
                 if (isRemovalNotification)
                 {
-                    this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, htmlContent, false);
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, false);
                 }
                 return false;
             }
 
             try
             {
-                string endpoint = $"https://graph.microsoft.com/v1.0/chats/{this.chatThreadId}/messages";
+                string endpoint = $"https://graph.microsoft.com/v1.0/chats/{threadId}/messages";
 
                 using (var client = new HttpClient())
                 {
@@ -779,12 +829,12 @@ namespace TeamsCallingBot.Bot
 
                     if (isRemovalNotification)
                     {
-                        this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, htmlContent, success);
+                        this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, success);
                     }
 
                     if (success)
                     {
-                        this.graphLogger.Info($"[Chat Notification] Successfully posted message to meeting chat {this.chatThreadId}!");
+                        this.graphLogger.Info($"[Chat Notification] Successfully posted message to meeting chat {threadId}!");
                         Console.WriteLine($">>> [Chat Notification] Successfully posted message to meeting chat!");
                         return true;
                     }
@@ -793,6 +843,10 @@ namespace TeamsCallingBot.Bot
                         var err = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         this.graphLogger.Warn($"[Chat Notification] Graph chat post returned ({response.StatusCode}): {err}");
                         Console.WriteLine($">>> [Chat Notification] Graph chat post returned ({response.StatusCode}): {err}");
+                        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                        {
+                            Console.WriteLine($">>> [ACTION NEEDED] Azure AD missing Application permission 'ChatMessage.Send.Chat' or 'Chat.ReadWrite.All'. Please grant Admin Consent in Azure Portal.");
+                        }
                         return false;
                     }
                 }
@@ -802,10 +856,132 @@ namespace TeamsCallingBot.Bot
                 this.graphLogger.Error(ex, "Error posting message to meeting chat.");
                 if (isRemovalNotification)
                 {
-                    this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, $"Exception: {ex.Message}", false);
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, $"Exception: {ex.Message}", false);
                 }
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Periodically monitors the Teams meeting group chat for mentions/prompts like "tda bot", "hi", "kaise ho",
+        /// replies directly in the group chat, and speaks the answer into the meeting call.
+        /// </summary>
+        private void StartMeetingChatMonitor()
+        {
+            this.chatMonitorCts = new CancellationTokenSource();
+            var token = this.chatMonitorCts.Token;
+
+            _ = Task.Run(async () =>
+            {
+                // Let call settle for a couple seconds before polling
+                await Task.Delay(3000, token).ConfigureAwait(false);
+                bool loggedPermissionNotice = false;
+
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        string threadId = this.GetEffectiveChatThreadId();
+                        string tokenStr = this.GetEffectiveAccessToken();
+
+                        if (!string.IsNullOrWhiteSpace(threadId) && !string.IsNullOrWhiteSpace(tokenStr))
+                        {
+                            string endpoint = $"https://graph.microsoft.com/v1.0/chats/{threadId}/messages?$top=10";
+
+                            using (var client = new HttpClient())
+                            {
+                                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tokenStr);
+                                var response = await client.GetAsync(endpoint, token).ConfigureAwait(false);
+
+                                if (response.IsSuccessStatusCode)
+                                {
+                                    var json = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                                    var jobj = JObject.Parse(json);
+                                    var messages = jobj["value"] as JArray;
+
+                                    if (messages != null && messages.Count > 0)
+                                    {
+                                        foreach (var msg in messages)
+                                        {
+                                            string id = msg["id"]?.ToString();
+                                            if (string.IsNullOrWhiteSpace(id)) continue;
+
+                                            // Ignore if already processed
+                                            if (this.processedChatMsgIds.Contains(id)) continue;
+                                            this.processedChatMsgIds.Add(id);
+
+                                            var fromObj = msg["from"];
+                                            string fromAppId = fromObj?["application"]?["id"]?.ToString();
+                                            string fromUserName = fromObj?["user"]?["displayName"]?.ToString() ?? "Participant";
+
+                                            // Skip messages generated by the bot itself
+                                            if (!string.IsNullOrWhiteSpace(fromAppId) &&
+                                                string.Equals(fromAppId, BotOptions.Current?.AadAppId, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                continue;
+                                            }
+
+                                            string bodyContent = msg["body"]?["content"]?.ToString() ?? "";
+                                            string plainText = System.Text.RegularExpressions.Regex.Replace(bodyContent, "<.*?>", string.Empty).Trim();
+
+                                            if (string.IsNullOrWhiteSpace(plainText)) continue;
+
+                                            this.graphLogger.Info($"[Chat Monitor] New message from {fromUserName}: \"{plainText}\"");
+                                            Console.WriteLine($">>> [Chat Monitor] New message from {fromUserName}: \"{plainText}\"");
+
+                                            string lower = plainText.ToLowerInvariant();
+                                            if (lower.Contains("tda") || lower.Contains("bot") || lower.Contains("kaise ho") ||
+                                                lower.Contains("hi") || lower.Contains("hello") || lower.Contains("hey") ||
+                                                lower.Contains("help") || lower.Contains("status"))
+                                            {
+                                                string chatReply;
+                                                string voiceReply;
+
+                                                if (lower.Contains("kaise ho"))
+                                                {
+                                                    chatReply = $"Hello {fromUserName}! 🙏 Main badhiya hoon (I'm doing well!). I am TDA Bot, your meeting assistant. How can I help you?";
+                                                    voiceReply = $"Hello {fromUserName}! Main badhiya hoon. I am doing well. How can I help you today?";
+                                                }
+                                                else if (lower.Contains("status") || lower.Contains("recording"))
+                                                {
+                                                    chatReply = $"📊 <b>TDA Bot Status:</b> Recording meeting audio, capturing screen shares, and actively listening to this session.";
+                                                    voiceReply = "TDA Bot is active, recording meeting audio, and capturing screen shares.";
+                                                }
+                                                else
+                                                {
+                                                    chatReply = $"Hello {fromUserName}! 👋 I am TDA Bot, your AI meeting assistant. I am actively listening and recording this meeting.";
+                                                    voiceReply = $"Hello {fromUserName}! I am TDA Bot, your meeting assistant. How can I assist you?";
+                                                }
+
+                                                // 1. Post reply to meeting chat
+                                                _ = this.PostTextMessageToChatAsync(chatReply);
+
+                                                // 2. Speak response aloud into meeting
+                                                if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
+                                                {
+                                                    _ = this.AudioSender.SpeakAsync(voiceReply);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                else if (response.StatusCode == System.Net.HttpStatusCode.Forbidden && !loggedPermissionNotice)
+                                {
+                                    loggedPermissionNotice = true;
+                                    Console.WriteLine(">>> [Chat Monitor] Note: Reading chat messages returned 403 Forbidden. Grant 'Chat.ReadWrite.All' or 'Chat.Read.All' Application permission in Azure Portal to enable chat replies.");
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        this.graphLogger.Warn($"[Chat Monitor] Polling error: {ex.Message}");
+                    }
+
+                    await Task.Delay(3000, token).ConfigureAwait(false);
+                }
+            }, token);
         }
 
         // ===================================================================
@@ -887,6 +1063,7 @@ namespace TeamsCallingBot.Bot
             this.videoBroadcastCts?.Cancel();
             this.periodicFlushCts?.Cancel();
             this.autoLeaveCts?.Cancel();
+            this.chatMonitorCts?.Cancel();
             this.AudioSender?.Dispose();
 
             this.Call.OnUpdated -= this.OnCallUpdated;
