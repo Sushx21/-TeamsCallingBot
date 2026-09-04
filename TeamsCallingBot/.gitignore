@@ -1,0 +1,33 @@
+# Visual Studio / .NET build artifacts
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Visual Studio files
+.vs/
+.vscode/
+
+# Sensitive Configuration (CRITICAL)
+appsettings.json
+appsettings.*.json
+!appsettings.template.json
+!appsettings.example.json
+
+# Temporary & Archive files
+*.zip
+*.7z
+*.tar.gz
+cache/
+recordings/
+logs/
+*.log
+
+# Windows thumbnail cache & desktop files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

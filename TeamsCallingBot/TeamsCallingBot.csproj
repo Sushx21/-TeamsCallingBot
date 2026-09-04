@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    net472 + x64 are not preferences - they are hard requirements from Microsoft for any bot
+    using Calls.Media (real-time/raw audio). See:
+    https://learn.microsoft.com/en-us/microsoftteams/platform/bots/calls-and-meetings/requirements-considerations-application-hosted-media-bots
+  -->
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>TeamsCallingBot</RootNamespace>
+    <AssemblyName>TeamsCallingBot</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Versions below are pinned to exactly what Microsoft's own official sample repo
+         (microsoft-graph-comms-samples) uses - verified against real .csproj files, not guessed. -->
+    <PackageReference Include="Google.Cloud.Storage.V1" Version="4.15.0" />
+    <PackageReference Include="Microsoft.AspNetCore" Version="2.2.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc" Version="2.2.0" />
+    <PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.3742" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.88.0" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.22.0" />
+    <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.20.0.348-alpha" />
+    <!-- Bumped from 13.0.3 (Microsoft sample's pinned version) to 13.0.4 - Google.Cloud.Storage.V1
+         transitively requires >=13.0.4, and this project errors on version downgrades. -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.22.0" />
+    <PackageReference Include="System.Security.Cryptography.X509Certificates" Version="4.3.0" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Speech" />
+  </ItemGroup>
+
+  <!--
+    NOT yet added (install these yourself via NuGet Package Manager -> Browse -> install latest stable,
+    since these versions were not verified against a real source file and I don't want to guess wrong):
+      - Microsoft.Identity.Client              (token acquisition for outbound Graph calls)
+      - Microsoft.IdentityModel.Protocols.OpenIdConnect  (validating inbound Graph notification tokens)
+      - System.IdentityModel.Tokens.Jwt         (same)
+  -->
+
+</Project>
