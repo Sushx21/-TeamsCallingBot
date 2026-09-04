@@ -83,6 +83,9 @@ namespace TeamsCallingBot.Bot
         private readonly string chatThreadId;
         private readonly string botAccessToken;
 
+        // Real-Time Voice Speech Recognition
+        private readonly RealtimeSpeechRecognizer voiceRecognizer;
+
         public ICall Call { get; }
 
         public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null)
@@ -187,6 +190,12 @@ namespace TeamsCallingBot.Bot
             // 5. Start Active Meeting Chat Monitor (replies to "tda bot", "hi", "kaise ho" in group chat + voice)
             this.StartMeetingChatMonitor();
 
+            // 6. Start Real-Time Voice Speech Recognizer (replies to spoken voice: "tda bot", "kaise ho", etc.)
+            this.voiceRecognizer = new RealtimeSpeechRecognizer(
+                this.graphLogger,
+                () => this.AudioSender != null && this.AudioSender.IsSpeaking);
+            this.voiceRecognizer.OnTriggerDetected += this.OnVoiceTriggerDetected;
+
             // Diagnostic: log what auth credentials are available for chat posting
             string diagAppId = BotOptions.Current?.AadAppId ?? "(null)";
             string diagSecret = string.IsNullOrWhiteSpace(BotOptions.Current?.AadAppSecretOrCertThumbprint) ? "(empty)" : $"({BotOptions.Current.AadAppSecretOrCertThumbprint.Length} chars)";
@@ -214,11 +223,14 @@ namespace TeamsCallingBot.Bot
                             speakerBuffer.Data,
                             speakerBuffer.Length,
                             speakerBuffer.OriginalSenderTimestamp);
+
+                        this.voiceRecognizer?.AppendAudio(speakerBuffer.Data, speakerBuffer.Length);
                     }
                 }
                 else
                 {
                     this.AudioAggregator.Append(AudioAggregator.UnknownSpeakerId, e.Buffer.Data, e.Buffer.Length, e.Buffer.Timestamp);
+                    this.voiceRecognizer?.AppendAudio(e.Buffer.Data, e.Buffer.Length);
                 }
             }
             finally
@@ -860,9 +872,10 @@ namespace TeamsCallingBot.Bot
                 }
             }
 
+            BotOptions.Reload();
             string appId = BotOptions.Current?.AadAppId;
             string appSecret = BotOptions.Current?.AadAppSecretOrCertThumbprint;
-            string tenantId = BotOptions.Current?.AadTenantId ?? "common";
+            string tenantId = BotOptions.Current?.AadTenantId;
 
             if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
             {
@@ -872,12 +885,10 @@ namespace TeamsCallingBot.Bot
                 return null;
             }
 
-            // Endpoints to attempt: specific tenant first, then common
-            var tokenEndpoints = new[]
-            {
-                $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token",
-                "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-            };
+            // Endpoints to attempt: specific tenant endpoint (do not use /common/ for single-tenant apps)
+            var tokenEndpoints = !string.IsNullOrWhiteSpace(tenantId) && !tenantId.Equals("common", StringComparison.OrdinalIgnoreCase)
+                ? new[] { $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token" }
+                : new[] { "https://login.microsoftonline.com/common/oauth2/v2.0/token" };
 
             foreach (var tokenEndpoint in tokenEndpoints)
             {
@@ -1198,6 +1209,36 @@ namespace TeamsCallingBot.Bot
             }
         }
 
+        /// <summary>
+        /// Handles real-time speech recognition triggers spoken aloud into the meeting microphone
+        /// (such as "tda bot", "kaise ho", "hi bot", "status", "help"). Replies immediately via voice and chat.
+        /// </summary>
+        private void OnVoiceTriggerDetected(string triggerText, string voiceReply, string chatReply)
+        {
+            this.graphLogger?.Info($"[Voice Trigger] Heard: \"{triggerText}\" -> Speaking aloud: \"{voiceReply}\"");
+            Console.WriteLine($">>> [Voice Trigger] Heard: \"{triggerText}\" -> Speaking aloud: \"{voiceReply}\"");
+
+            // 1. Speak aloud into the meeting audio stream immediately
+            if (this.AudioSender != null)
+            {
+                _ = this.AudioSender.SpeakAsync(voiceReply);
+            }
+
+            // 2. Also attempt to post the reply to the meeting chat
+            string effectiveThreadId = this.GetEffectiveChatThreadId();
+            if (!string.IsNullOrWhiteSpace(effectiveThreadId) && !string.IsNullOrWhiteSpace(chatReply))
+            {
+                _ = Task.Run(async () =>
+                {
+                    bool sent = await this.PostActivityViaBotFrameworkAsync(effectiveThreadId, chatReply).ConfigureAwait(false);
+                    if (!sent)
+                    {
+                        await this.PostTextMessageToChatAsync(chatReply).ConfigureAwait(false);
+                    }
+                });
+            }
+        }
+
         // ===================================================================
         // 4. Transcript & Audio Disk Saving (Wind-Down)
         // ===================================================================
@@ -1278,6 +1319,7 @@ namespace TeamsCallingBot.Bot
             this.periodicFlushCts?.Cancel();
             this.autoLeaveCts?.Cancel();
             this.chatMonitorCts?.Cancel();
+            this.voiceRecognizer?.Dispose();
             this.AudioSender?.Dispose();
 
             this.Call.OnUpdated -= this.OnCallUpdated;

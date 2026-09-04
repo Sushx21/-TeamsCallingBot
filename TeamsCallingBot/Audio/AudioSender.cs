@@ -28,6 +28,7 @@ namespace TeamsCallingBot.Audio
 
         public bool IsMuted { get; set; } = false;
         public bool IsAudioSendActive { get; private set; } = false;
+        public bool IsSpeaking { get; private set; } = false;
 
         public AudioSender(IAudioSocket audioSocket, IGraphLogger graphLogger)
         {
@@ -132,6 +133,7 @@ namespace TeamsCallingBot.Audio
 
             try
             {
+                this.IsSpeaking = true;
                 int frameIndex = 0;
                 while (offset < pcmData.Length && !token.IsCancellationRequested)
                 {
@@ -195,6 +197,7 @@ namespace TeamsCallingBot.Audio
             }
             finally
             {
+                this.IsSpeaking = false;
                 // Brief delay so native audio transport finishes transmitting before memory is freed
                 try { await Task.Delay(300).ConfigureAwait(false); } catch { }
                 for (int i = 0; i < poolSize; i++)
@@ -253,7 +256,8 @@ namespace TeamsCallingBot.Audio
                 using (var synth = new System.Speech.Synthesis.SpeechSynthesizer())
                 using (var ms = new MemoryStream())
                 {
-                    synth.Rate = 2; // Crisp, energetic tempo so responses don't drag out
+                    synth.Rate = 1; // Natural, clear and energetic tempo
+                    try { synth.SelectVoiceByHints(System.Speech.Synthesis.VoiceGender.Female); } catch { }
                     var format = new System.Speech.AudioFormat.SpeechAudioFormatInfo(SampleRate, System.Speech.AudioFormat.AudioBitsPerSample.Sixteen, System.Speech.AudioFormat.AudioChannel.Mono);
                     synth.SetOutputToAudioStream(ms, format);
                     synth.Speak(text);
@@ -265,6 +269,7 @@ namespace TeamsCallingBot.Audio
                     this.graphLogger?.Info($"[AudioSender] Speaking text: {text} ({pcmData.Length} bytes)");
                     Console.WriteLine($">>> [AudioSender] Speaking into call: \"{text}\"");
                     await PlayPcmBytesAsync(pcmData, cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($">>> [AudioSender] Finished speaking aloud into call: \"{text}\"");
                 }
             }
             catch (Exception ex)

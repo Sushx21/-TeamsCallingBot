@@ -79,7 +79,7 @@ namespace TeamsCallingBot.Config
         public static BotOptions LoadFromConfig()
         {
             IConfiguration config = new ConfigurationBuilder()
-                .AddJsonFile("appsettings.json", optional: false)
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
                 .AddEnvironmentVariables()
                 .Build();
 
@@ -87,6 +87,11 @@ namespace TeamsCallingBot.Config
             config.GetSection("Bot").Bind(options);
             Current = options;
             return options;
+        }
+
+        public static BotOptions Reload()
+        {
+            return LoadFromConfig();
         }
     }
 }
