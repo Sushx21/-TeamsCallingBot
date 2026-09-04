@@ -123,8 +123,16 @@ namespace TeamsCallingBot.Audio
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             long targetElapsedMs = 0;
 
+            const int poolSize = 16;
+            IntPtr[] audioPool = new IntPtr[poolSize];
+            for (int i = 0; i < poolSize; i++)
+            {
+                audioPool[i] = Marshal.AllocHGlobal(BytesPerFrame);
+            }
+
             try
             {
+                int frameIndex = 0;
                 while (offset < pcmData.Length && !token.IsCancellationRequested)
                 {
                     if (this.IsMuted)
@@ -144,21 +152,19 @@ namespace TeamsCallingBot.Audio
 
                     if (this.IsAudioSendActive)
                     {
-                        // Allocate unmanaged memory specifically for this frame.
-                        // AudioSendBuffer.Dispose() calls Marshal.FreeHGlobal() on this pointer!
-                        IntPtr unmanaged = Marshal.AllocHGlobal(BytesPerFrame);
-                        Marshal.Copy(frameBuffer, 0, unmanaged, BytesPerFrame);
+                        int slot = frameIndex % poolSize;
+                        Marshal.Copy(frameBuffer, 0, audioPool[slot], BytesPerFrame);
 
-                        using (var audioMediaBuffer = new AudioSendBuffer(
-                            unmanaged,
+                        var audioMediaBuffer = new SafeAudioMediaBuffer(
+                            audioPool[slot],
                             (long)BytesPerFrame,
                             AudioFormat.Pcm16K,
-                            (long)timestamp))
-                        {
-                            this.audioSocket.Send(audioMediaBuffer);
-                        }
+                            (long)timestamp);
+
+                        this.audioSocket.Send(audioMediaBuffer);
                     }
 
+                    frameIndex++;
                     offset += BytesPerFrame;
                     timestamp += FrameDurationMs;
                     targetElapsedMs += FrameDurationMs;
@@ -186,6 +192,19 @@ namespace TeamsCallingBot.Audio
             catch (Exception ex)
             {
                 this.graphLogger?.Error(ex, "AudioSender: Error during audio frame playback.");
+            }
+            finally
+            {
+                // Brief delay so native audio transport finishes transmitting before memory is freed
+                try { await Task.Delay(300).ConfigureAwait(false); } catch { }
+                for (int i = 0; i < poolSize; i++)
+                {
+                    if (audioPool[i] != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(audioPool[i]);
+                        audioPool[i] = IntPtr.Zero;
+                    }
+                }
             }
         }
 
@@ -234,7 +253,7 @@ namespace TeamsCallingBot.Audio
                 using (var synth = new System.Speech.Synthesis.SpeechSynthesizer())
                 using (var ms = new MemoryStream())
                 {
-                    synth.Rate = 1; // Natural, clear conversational tempo (default 0 is too slow)
+                    synth.Rate = 2; // Crisp, energetic tempo so responses don't drag out
                     var format = new System.Speech.AudioFormat.SpeechAudioFormatInfo(SampleRate, System.Speech.AudioFormat.AudioBitsPerSample.Sixteen, System.Speech.AudioFormat.AudioChannel.Mono);
                     synth.SetOutputToAudioStream(ms, format);
                     synth.Speak(text);

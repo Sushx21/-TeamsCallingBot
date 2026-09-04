@@ -475,6 +475,20 @@ namespace TeamsCallingBot.Bot
                 bool loggedFirstSend = false;
                 bool loggedFirstError = false;
                 int consecutiveErrors = 0;
+                int bufSize = width * height * 3 / 2; // 1,382,400 bytes for NV12 1280x720
+
+                // CRITICAL STABILITY FIX: Pre-allocate a pool of 6 unmanaged video frame buffers (8.3 MB total).
+                // Standard VideoSendBuffer calls Marshal.FreeHGlobal() immediately upon Dispose(), which causes
+                // native video encoder worker threads in mpencoder.dll / MediaApi.dll to access freed memory
+                // and crash the process with Access Violation (0xc0000005).
+                // With SafeVideoMediaBuffer and a ring buffer pool, each slot has 6 * 66ms = 400ms safety
+                // window for the native encoder to finish reading the frame before the slot is reused.
+                const int poolSize = 6;
+                IntPtr[] videoBufferPool = new IntPtr[poolSize];
+                for (int i = 0; i < poolSize; i++)
+                {
+                    videoBufferPool[i] = Marshal.AllocHGlobal(bufSize);
+                }
 
                 // Wait for call to be established before sending frames
                 await Task.Delay(2000, token).ConfigureAwait(false);
@@ -507,20 +521,18 @@ namespace TeamsCallingBot.Bot
 
                             byte[] nv12Bytes = VideoFrameConverter.ConvertBitmapToNV12(card, width, height);
 
-                            // CRITICAL FIX: Send frames unconditionally.
-                            // The isVideoSendActive event may never fire on some MediaPlatform builds,
-                            // preventing the bot from ever becoming visible. Sending when the socket
-                            // isn't ready throws an exception, which we catch and retry next tick.
                             try
                             {
-                                using (var videoBuffer = new VideoSendBuffer(
-                                    nv12Bytes,
-                                    (uint)nv12Bytes.Length,
+                                int slot = tick % poolSize;
+                                Marshal.Copy(nv12Bytes, 0, videoBufferPool[slot], bufSize);
+
+                                var videoBuffer = new SafeVideoMediaBuffer(
+                                    videoBufferPool[slot],
+                                    bufSize,
                                     VideoFormat.NV12_1280x720_30Fps,
-                                    (long)timestamp))
-                                {
-                                    this.videoSocket.Send(videoBuffer);
-                                }
+                                    (long)timestamp);
+
+                                this.videoSocket.Send(videoBuffer);
 
                                 consecutiveErrors = 0;
                                 if (!loggedFirstSend)
@@ -555,6 +567,18 @@ namespace TeamsCallingBot.Bot
                 {
                     this.graphLogger.Error(ex, "Error in bot video broadcast loop.");
                     Console.WriteLine($">>> [Bot Video] FATAL broadcast loop error: {ex.Message}");
+                }
+                finally
+                {
+                    // Clean up unmanaged video buffers when broadcast loop exits
+                    for (int i = 0; i < poolSize; i++)
+                    {
+                        if (videoBufferPool[i] != IntPtr.Zero)
+                        {
+                            Marshal.FreeHGlobal(videoBufferPool[i]);
+                            videoBufferPool[i] = IntPtr.Zero;
+                        }
+                    }
                 }
             }, token);
 
@@ -826,7 +850,7 @@ namespace TeamsCallingBot.Bot
         /// Acquires a Bot Framework OAuth token using app credentials (audience: https://api.botframework.com).
         /// This bypasses Microsoft Graph's ChatMessage.Send permission requirements completely!
         /// </summary>
-        public static async Task<string> GetBotFrameworkTokenAsync()
+        public static async Task<string> GetBotFrameworkTokenAsync(IGraphLogger logger = null)
         {
             lock (bfTokenLock)
             {
@@ -842,52 +866,68 @@ namespace TeamsCallingBot.Bot
 
             if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
             {
-                Console.WriteLine($">>> [BF Token] CANNOT acquire token: AppId={(string.IsNullOrWhiteSpace(appId) ? "MISSING" : "OK")}, Secret={(string.IsNullOrWhiteSpace(appSecret) ? "MISSING" : "OK")}");
+                string missing = $"AppId={(string.IsNullOrWhiteSpace(appId) ? "MISSING" : "OK")}, Secret={(string.IsNullOrWhiteSpace(appSecret) ? "MISSING" : "OK")}";
+                Console.WriteLine($">>> [BF Token] CANNOT acquire token: {missing}");
+                logger?.Warn($"[BF Token] CANNOT acquire token: {missing}");
                 return null;
             }
 
-            try
+            // Endpoints to attempt: specific tenant first, then common
+            var tokenEndpoints = new[]
             {
-                Console.WriteLine($">>> [BF Token] Requesting token from login.microsoftonline.com/{tenantId} for api.botframework.com...");
+                $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+            };
 
-                using (var client = new HttpClient())
+            foreach (var tokenEndpoint in tokenEndpoints)
+            {
+                try
                 {
-                    var pairs = new List<KeyValuePair<string, string>>
+                    Console.WriteLine($">>> [BF Token] Requesting token from {tokenEndpoint} for api.botframework.com...");
+                    logger?.Info($"[BF Token] Requesting token from {tokenEndpoint} for api.botframework.com...");
+
+                    using (var client = new HttpClient())
                     {
-                        new KeyValuePair<string, string>("grant_type", "client_credentials"),
-                        new KeyValuePair<string, string>("client_id", appId),
-                        new KeyValuePair<string, string>("client_secret", appSecret),
-                        new KeyValuePair<string, string>("scope", "https://api.botframework.com/.default")
-                    };
-
-                    var content = new FormUrlEncodedContent(pairs);
-                    var resp = await client.PostAsync($"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token", content).ConfigureAwait(false);
-                    var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
-
-                    if (resp.IsSuccessStatusCode)
-                    {
-                        var jobj = JObject.Parse(json);
-                        string token = jobj["access_token"]?.ToString();
-                        int expiresIn = jobj["expires_in"]?.Value<int>() ?? 3600;
-
-                        lock (bfTokenLock)
+                        var pairs = new List<KeyValuePair<string, string>>
                         {
-                            cachedBfToken = token;
-                            bfTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
-                        }
+                            new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                            new KeyValuePair<string, string>("client_id", appId),
+                            new KeyValuePair<string, string>("client_secret", appSecret),
+                            new KeyValuePair<string, string>("scope", "https://api.botframework.com/.default")
+                        };
 
-                        Console.WriteLine($">>> [BF Token] SUCCESS - token acquired, expires in {expiresIn}s");
-                        return token;
-                    }
-                    else
-                    {
-                        Console.WriteLine($">>> [BF Token] FAILED ({(int)resp.StatusCode}): {json}");
+                        var content = new FormUrlEncodedContent(pairs);
+                        var resp = await client.PostAsync(tokenEndpoint, content).ConfigureAwait(false);
+                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            var jobj = JObject.Parse(json);
+                            string token = jobj["access_token"]?.ToString();
+                            int expiresIn = jobj["expires_in"]?.Value<int>() ?? 3600;
+
+                            lock (bfTokenLock)
+                            {
+                                cachedBfToken = token;
+                                bfTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+                            }
+
+                            Console.WriteLine($">>> [BF Token] SUCCESS - token acquired from {tokenEndpoint}, expires in {expiresIn}s");
+                            logger?.Info($"[BF Token] SUCCESS - token acquired from {tokenEndpoint}, expires in {expiresIn}s");
+                            return token;
+                        }
+                        else
+                        {
+                            Console.WriteLine($">>> [BF Token] {tokenEndpoint} FAILED ({(int)resp.StatusCode}): {json}");
+                            logger?.Warn($"[BF Token] {tokenEndpoint} FAILED ({(int)resp.StatusCode}): {json}");
+                        }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($">>> [BF Token] EXCEPTION: {ex.GetType().Name}: {ex.Message}");
+                catch (Exception ex)
+                {
+                    Console.WriteLine($">>> [BF Token] EXCEPTION on {tokenEndpoint}: {ex.GetType().Name}: {ex.Message}");
+                    logger?.Error(ex, $"[BF Token] EXCEPTION on {tokenEndpoint}");
+                }
             }
 
             return null;
@@ -900,7 +940,7 @@ namespace TeamsCallingBot.Bot
         /// </summary>
         public async Task<bool> PostActivityViaBotFrameworkAsync(string threadId, string text)
         {
-            string bfToken = await GetBotFrameworkTokenAsync().ConfigureAwait(false);
+            string bfToken = await GetBotFrameworkTokenAsync(this.graphLogger).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(bfToken))
             {
                 this.graphLogger.Warn("[BotFramework Connector] Could not acquire Bot Framework token.");
@@ -916,8 +956,8 @@ namespace TeamsCallingBot.Bot
             var serviceUrls = new[]
             {
                 "https://smba.trafficmanager.net/apis/",
-                "https://smba.trafficmanager.net/amer/",
                 "https://smba.trafficmanager.net/apac/",
+                "https://smba.trafficmanager.net/amer/",
                 "https://smba.trafficmanager.net/emea/"
             };
 
@@ -949,7 +989,7 @@ namespace TeamsCallingBot.Bot
 
                         if (resp.IsSuccessStatusCode)
                         {
-                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted to {serviceUrl}");
+                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted message to {serviceUrl}");
                             Console.WriteLine($">>> [BotFramework Connector] Message sent successfully via {serviceUrl}");
                             return true;
                         }
@@ -958,6 +998,13 @@ namespace TeamsCallingBot.Bot
                             string errBody = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                             this.graphLogger.Warn($"[BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
                             Console.WriteLine($">>> [BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
+
+                            if (errBody != null && errBody.IndexOf("BotNotInConversationRoster", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                this.graphLogger.Warn("[BotFramework Connector] BotNotInConversationRoster: The bot app is not yet added to this meeting's roster. To enable meeting chat posting, a participant should click '+' (Apps) in Teams meeting and add the bot app.");
+                                Console.WriteLine(">>> [BotFramework Connector] HINT: Add the bot app to this meeting via '+' (Apps) in Teams to allow it in the meeting chat roster.");
+                                return false;
+                            }
 
                             // If 401 on first attempt, the token is invalid — bail immediately.
                             if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized) return false;
