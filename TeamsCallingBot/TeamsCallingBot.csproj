@@ -32,6 +32,14 @@
     <Reference Include="System.Net.Http" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Speech" />
+    <Reference Include="System.IO.Compression" />
+  </ItemGroup>
+
+  <!-- PARKED (2026-09-04, POC focus is video): the Minutes-of-Meeting / Word document generator in
+       Mom\ is complete but excluded from compilation until the video POC is signed off. Remove this
+       line to build it in (see docs/VIDEO_RECORDING_AND_MOM.md). -->
+  <ItemGroup>
+    <Compile Remove="Mom\**" />
   </ItemGroup>
 
   <!--

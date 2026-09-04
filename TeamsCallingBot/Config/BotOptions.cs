@@ -17,6 +17,7 @@ namespace TeamsCallingBot.Config
         /// <summary>
         /// Either a client secret or a certificate thumbprint, depending on what Infra issues for app 5f6516f0.
         /// AuthenticationProvider currently only implements secret-based auth - see TODO there if a cert is issued instead.
+        /// The SAME secret is used for the Bot Framework Connector token (chat posting) - see BotFrameworkChatClient.
         /// </summary>
         public string AadAppSecretOrCertThumbprint { get; set; }
 
@@ -31,9 +32,8 @@ namespace TeamsCallingBot.Config
         public string ServiceDnsName { get; set; }
 
         /// <summary>
-        /// The VM's real, reserved external IP (e.g. from `gcloud compute instances describe` or the
-        /// Cloud Console VM details page) - distinct from ServiceDnsName because MediaPlatformInstanceSettings
-        /// needs both a literal IPAddress AND a separate FQDN.
+        /// The VM's real, reserved external IP (from the cloud console VM details page) - distinct from
+        /// ServiceDnsName because MediaPlatformInstanceSettings needs both a literal IPAddress AND a separate FQDN.
         /// </summary>
         public string InstancePublicIpAddress { get; set; }
 
@@ -63,12 +63,105 @@ namespace TeamsCallingBot.Config
         public int MaxConcurrentCalls { get; set; } = 3;
 
         /// <summary>
-        /// Where TranscriptSaver writes the two transcript files. Point this at wherever
-        /// Google Drive for Desktop's synced folder lives on the VM (set up once, interactively,
-        /// over RDP) to get transcripts into Drive automatically with zero API/auth code - defaults
-        /// to a plain local folder if left blank.
+        /// Where recordings/transcripts are written. Point this at wherever Google Drive for Desktop's
+        /// synced folder lives on the VM to get everything into Drive automatically - defaults to a
+        /// plain local folder if left blank (see RecordingsManager.ResolveDefaultDirectory).
         /// </summary>
         public string TranscriptOutputFolder { get; set; }
+
+        // -------------------------------------------------------------------------------------
+        // Video recording (screen share + participant camera) - see docs/VIDEO_RECORDING_AND_MOM.md
+        // -------------------------------------------------------------------------------------
+
+        /// <summary>Record each participant's screen share (VBSS) to a per-person video file.</summary>
+        public bool RecordScreenShare { get; set; } = true;
+
+        /// <summary>Record the subscribed participant camera stream to a per-person video file.</summary>
+        public bool RecordParticipantVideo { get; set; } = true;
+
+        /// <summary>
+        /// Target frames per second written to the screen-share video file. Teams delivers screen
+        /// share at a variable rate (often 1-30 fps); frames are sampled/duplicated onto this fixed
+        /// timeline so playback timing stays real-time. 5 fps is plenty for slides/documents and
+        /// keeps CPU + disk low (1080p MJPEG at 5 fps is roughly 30-45 MB/minute).
+        /// </summary>
+        public int ScreenShareRecordingFps { get; set; } = 5;
+
+        /// <summary>Target frames per second for participant camera recordings.</summary>
+        public int ParticipantVideoRecordingFps { get; set; } = 3;
+
+        /// <summary>JPEG quality (1-100) for recorded video frames and snapshots.</summary>
+        public int VideoJpegQuality { get; set; } = 75;
+
+        /// <summary>How often (seconds) a still JPEG snapshot of the shared screen is saved for the MoM.</summary>
+        public int SnapshotIntervalSeconds { get; set; } = 10;
+
+        /// <summary>
+        /// A new video segment file is started once the current one exceeds this size (bytes).
+        /// Plain RIFF AVI files must stay under 2 GB, so the default rolls over well before that.
+        /// </summary>
+        public long MaxVideoSegmentBytes { get; set; } = 1_500_000_000;
+
+        /// <summary>
+        /// Optional full path to ffmpeg.exe. When set and present, every finished AVI segment is
+        /// re-encoded to H.264 MP4 at call end (the AVI is kept). Leave blank to skip.
+        /// </summary>
+        public string FfmpegPath { get; set; } = string.Empty;
+
+        // -------------------------------------------------------------------------------------
+        // Voice / greetings
+        // -------------------------------------------------------------------------------------
+
+        /// <summary>Speak the greeting (GreetingText) into the meeting once audio send becomes active.</summary>
+        public bool SpeakGreetingOnJoin { get; set; } = true;
+
+        /// <summary>Say a short "Hi &lt;name&gt;" when a human participant joins after the bot.</summary>
+        public bool GreetParticipantsByName { get; set; } = true;
+
+        /// <summary>Speak + post to chat when a participant starts sharing their screen.</summary>
+        public bool AnnounceScreenShare { get; set; } = true;
+
+        public string GreetingText { get; set; } =
+            "Hello everyone, I am the AI meeting assistant. I have joined to record this meeting and prepare the minutes.";
+
+        /// <summary>
+        /// Culture of the Windows TTS voice to prefer, e.g. "en-IN" for Indian English. The bot picks
+        /// the first installed System.Speech voice for this culture (Microsoft Heera / Ravi on
+        /// Windows 10/11). Falls back to the default voice if none is installed.
+        /// </summary>
+        public string TtsCulture { get; set; } = "en-IN";
+
+        /// <summary>Exact installed voice name to force, e.g. "Microsoft Heera Desktop". Overrides TtsCulture.</summary>
+        public string TtsVoiceName { get; set; } = string.Empty;
+
+        /// <summary>"Female" or "Male" hint used when several voices match TtsCulture.</summary>
+        public string TtsVoiceGender { get; set; } = "Female";
+
+        // -------------------------------------------------------------------------------------
+        // Chat posting via the Bot Framework Connector (Azure Bot Service registration)
+        // -------------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Post meeting-chat messages through the Bot Framework Connector API
+        /// (POST {ServiceUrl}/v3/conversations/{chatThreadId}/activities) using a token for audience
+        /// https://api.botframework.com - a separate permission system from Graph, so no
+        /// ChatMessage.Send admin consent is needed. Falls back to the Graph chat API when disabled
+        /// or when the Connector call fails.
+        /// </summary>
+        public bool UseBotFrameworkForChat { get; set; } = true;
+
+        /// <summary>
+        /// Teams service URL for the Connector. "https://smba.trafficmanager.net/teams/" is the global
+        /// entry point; regional ones are .../amer/, .../emea/, .../apac/, .../in/. If a real
+        /// activity from Teams was ever received, its serviceUrl is the authoritative value.
+        /// </summary>
+        public string BotFrameworkServiceUrl { get; set; } = "https://smba.trafficmanager.net/teams/";
+
+        // -------------------------------------------------------------------------------------
+        // Minutes of Meeting generation
+        // -------------------------------------------------------------------------------------
+
+        public MomOptions Mom { get; set; } = new MomOptions();
 
         /// <summary>
         /// Set once at startup (Startup.cs) so static classes without DI access (TranscriptSaver)
@@ -85,8 +178,52 @@ namespace TeamsCallingBot.Config
 
             var options = new BotOptions();
             config.GetSection("Bot").Bind(options);
+            if (options.Mom == null)
+            {
+                options.Mom = new MomOptions();
+            }
+
             Current = options;
             return options;
         }
+    }
+
+    /// <summary>
+    /// Settings for the Minutes-of-Meeting (MoM) Word document produced at the end of every call.
+    /// The local builder always runs (no network). The Claude summarizer is optional and only used
+    /// when an API key is configured - it reads the transcript AND looks at screen-share snapshots
+    /// to produce the detailed narrative, decisions and action items.
+    /// </summary>
+    public class MomOptions
+    {
+        /// <summary>Write 08_minutes_of_meeting.docx (+ .md and .json) at call end.</summary>
+        public bool GenerateWordDocument { get; set; } = true;
+
+        /// <summary>
+        /// Anthropic API key. Leave empty to stay fully local (heuristic MoM only). Can also be
+        /// supplied through the ANTHROPIC_API_KEY environment variable.
+        /// </summary>
+        public string AnthropicApiKey { get; set; } = string.Empty;
+
+        /// <summary>Claude model id used for summarisation.</summary>
+        public string Model { get; set; } = "claude-opus-5";
+
+        /// <summary>Maximum number of screen-share snapshots sent to the model as images.</summary>
+        public int MaxSnapshotsForAi { get; set; } = 12;
+
+        /// <summary>Language the MoM should be written in.</summary>
+        public string Language { get; set; } = "English";
+
+        /// <summary>Optional organisation name printed in the document header.</summary>
+        public string OrganizationName { get; set; } = string.Empty;
+
+        /// <summary>Embed screen-share snapshots into the Word document.</summary>
+        public bool EmbedSnapshots { get; set; } = true;
+
+        /// <summary>Maximum number of snapshots embedded into the Word document.</summary>
+        public int MaxSnapshotsInDocument { get; set; } = 20;
+
+        /// <summary>HTTP timeout (seconds) for the summarisation request.</summary>
+        public int RequestTimeoutSeconds { get; set; } = 600;
     }
 }

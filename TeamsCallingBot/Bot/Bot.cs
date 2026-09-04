@@ -121,7 +121,14 @@ namespace TeamsCallingBot.Bot
                         {
                             StreamDirections = StreamDirection.Sendrecv,
                             ReceiveColorFormat = VideoColorFormat.NV12,
-                            SupportedSendVideoFormats = new List<VideoFormat> { VideoFormat.NV12_1280x720_30Fps },
+                            // 15 fps formats: the status card is rendered in software, 15 fps halves the CPU
+                            // cost vs 30 fps and Teams picks the best one (PreferredVideoSourceFormat) for the
+                            // available bandwidth. CallHandler honours whichever Teams asks for.
+                            SupportedSendVideoFormats = new List<VideoFormat>
+                            {
+                                VideoFormat.NV12_1280x720_15Fps,
+                                VideoFormat.NV12_640x360_15Fps,
+                            },
                         }
                     },
                     new VideoSocketSettings
