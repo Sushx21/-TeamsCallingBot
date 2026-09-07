@@ -1419,7 +1419,34 @@ namespace TeamsCallingBot.Bot
                 this.graphLogger.Warn($"[Timeline] Save failed: {ex.Message}");
             }
 
-            // 6. Save Session Metadata
+            // 6. Generate Minutes of Meeting (MoM) - detailed Word doc from transcript + screen snapshots
+            if (this.options.Mom?.Enabled == true)
+            {
+                try
+                {
+                    var talkTimeByName = speakerAudios.ToDictionary(
+                        s => this.ResolveSpeakerName(s.SpeakerId),
+                        s => s.TotalDurationSeconds,
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var momResult = await TeamsCallingBot.Mom.MomGenerator.GenerateAsync(
+                        this.RecordingsManager.SessionDirectory,
+                        this.Timeline,
+                        entries,
+                        talkTimeByName,
+                        this.options.Mom,
+                        msg => this.RecordingsManager.Log(msg)).ConfigureAwait(false);
+
+                    this.graphLogger.Info($"[MoM] Generated {momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath} (AI: {momResult.UsedAi})");
+                    Console.WriteLine($">>> [MoM] Generated {(momResult.UsedAi ? "AI-enhanced" : "local")} Minutes of Meeting -> {Path.GetFileName(momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath)}");
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Error(ex, "[MoM] Generation failed.");
+                }
+            }
+
+            // 7. Save Session Metadata
             var metadata = new
             {
                 SessionId = this.Call.Id,
