@@ -908,6 +908,11 @@ namespace TeamsCallingBot.Bot
 
         private void StartBotVideoBroadcast()
         {
+            if (this.videoSocket == null)
+            {
+                return;
+            }
+
             this.videoBroadcastCts = new CancellationTokenSource();
             var token = this.videoBroadcastCts.Token;
 
@@ -917,6 +922,14 @@ namespace TeamsCallingBot.Bot
                 const int frameDelayMs = 1000 / fps;
                 int tick = 0;
                 var pace = System.Diagnostics.Stopwatch.StartNew();
+
+                const int poolSize = 6;
+                const int maxBufSize = 1920 * 1080 * 3 / 2; // Supports up to 1080p NV12, 1280x720 is 1,382,400 bytes
+                IntPtr[] videoBufferPool = new IntPtr[poolSize];
+                for (int i = 0; i < poolSize; i++)
+                {
+                    videoBufferPool[i] = Marshal.AllocHGlobal(maxBufSize);
+                }
 
                 try
                 {
@@ -937,23 +950,49 @@ namespace TeamsCallingBot.Bot
                     this.graphLogger.Warn($"Failed to save preview: {ex.Message}");
                 }
 
-                while (!token.IsCancellationRequested)
-                {
-                    if (this.isVideoSendActive)
-                    {
-                        this.SendCardFrame(tick++);
-                    }
+                // Initial safety delay: allow call & media socket to settle
+                await Task.Delay(2000, token).ConfigureAwait(false);
 
-                    long elapsed = pace.ElapsedMilliseconds;
-                    int wait = (int)Math.Max(1, frameDelayMs - elapsed);
-                    pace.Restart();
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        if (this.isVideoSendActive && this.callEstablished)
+                        {
+                            this.SendCardFrame(tick++, videoBufferPool, poolSize, maxBufSize);
+                        }
+
+                        long elapsed = pace.ElapsedMilliseconds;
+                        int wait = (int)Math.Max(1, frameDelayMs - elapsed);
+                        pace.Restart();
+                        try
+                        {
+                            await Task.Delay(wait, token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
+                }
+                finally
+                {
+                    // Allow native encoder worker threads to finish reading in-flight buffers
                     try
                     {
-                        await Task.Delay(wait, token).ConfigureAwait(false);
+                        Thread.Sleep(500);
+                        for (int i = 0; i < poolSize; i++)
+                        {
+                            if (videoBufferPool[i] != IntPtr.Zero)
+                            {
+                                Marshal.FreeHGlobal(videoBufferPool[i]);
+                                videoBufferPool[i] = IntPtr.Zero;
+                            }
+                        }
                     }
-                    catch (OperationCanceledException)
+                    catch (Exception ex)
                     {
-                        break;
+                        this.graphLogger.Warn($"Error cleaning up video buffer pool: {ex.Message}");
                     }
                 }
 
@@ -963,9 +1002,9 @@ namespace TeamsCallingBot.Bot
             this.graphLogger.Info("[Bot Video Streaming] Broadcast loop initialized at 15 FPS.");
         }
 
-        private void SendCardFrame(int tick)
+        private void SendCardFrame(int tick, IntPtr[] pool, int poolSize, int maxBufSize)
         {
-            if (!this.isVideoSendActive || this.videoSocket == null)
+            if (!this.isVideoSendActive || this.videoSocket == null || !this.callEstablished)
             {
                 return;
             }
@@ -974,7 +1013,7 @@ namespace TeamsCallingBot.Bot
 
             lock (this.sendLock)
             {
-                if (!this.isVideoSendActive)
+                if (!this.isVideoSendActive || !this.callEstablished)
                 {
                     return;
                 }
@@ -1007,10 +1046,17 @@ namespace TeamsCallingBot.Bot
                         customVis?.Dispose();
                         byte[] nv12 = VideoFrameConverter.ConvertBitmapToNV12(card, format.Width, format.Height);
 
-                        using (var videoBuffer = new VideoSendBuffer(nv12, (uint)nv12.Length, format, MediaPlatform.GetCurrentTimestamp()))
-                        {
-                            this.videoSocket.Send(videoBuffer);
-                        }
+                        int slot = tick % poolSize;
+                        int bytesToCopy = Math.Min(nv12.Length, maxBufSize);
+                        Marshal.Copy(nv12, 0, pool[slot], bytesToCopy);
+
+                        var videoBuffer = new SafeVideoMediaBuffer(
+                            pool[slot],
+                            (long)bytesToCopy,
+                            format,
+                            MediaPlatform.GetCurrentTimestamp());
+
+                        this.videoSocket.Send(videoBuffer);
                     }
                 }
                 catch (Exception ex)
