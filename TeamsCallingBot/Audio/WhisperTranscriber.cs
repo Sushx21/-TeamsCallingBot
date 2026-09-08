@@ -59,7 +59,14 @@ namespace TeamsCallingBot.Audio
                     }
                 }
 
-                // Priority 2: Graceful Audio Analysis Fallback (Duration and Speech Activity)
+                // Priority 2: Windows System.Speech transcription
+                var systemSpeechText = TranscribeWithSystemSpeech(wavPath);
+                if (!string.IsNullOrWhiteSpace(systemSpeechText))
+                {
+                    return systemSpeechText;
+                }
+
+                // Priority 3: Graceful Audio Analysis Fallback (Duration and Speech Activity)
                 return AnalyzeAudioActivity(wavPath);
             }
             catch (Exception ex)
@@ -113,6 +120,42 @@ namespace TeamsCallingBot.Audio
             catch
             {
                 return $"[Audio segment: {Path.GetFileName(wavPath)}]";
+            }
+        }
+
+        private static string TranscribeWithSystemSpeech(string wavPath)
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder();
+                using (var engine = new System.Speech.Recognition.SpeechRecognitionEngine(new System.Globalization.CultureInfo("en-US")))
+                {
+                    engine.LoadGrammar(new System.Speech.Recognition.DictationGrammar());
+                    engine.SpeechRecognized += (s, e) =>
+                    {
+                        if (e.Result != null && !string.IsNullOrWhiteSpace(e.Result.Text))
+                        {
+                            sb.Append(e.Result.Text).Append(" ");
+                        }
+                    };
+
+                    using (var stream = File.OpenRead(wavPath))
+                    {
+                        engine.SetInputToWaveStream(stream);
+                        while (true)
+                        {
+                            var res = engine.Recognize(TimeSpan.FromSeconds(2));
+                            if (res == null) break;
+                        }
+                    }
+                }
+
+                string result = sb.ToString().Trim();
+                return string.IsNullOrWhiteSpace(result) ? null : result;
+            }
+            catch
+            {
+                return null;
             }
         }
 

@@ -79,6 +79,7 @@ namespace TeamsCallingBot.Bot
 
             this.Client = builder.Build();
             this.Client.Calls().OnUpdated += this.CallsOnUpdated;
+            this.Client.Calls().OnIncoming += this.CallsOnIncoming;
         }
 
         public ICommunicationsClient Client { get; }
@@ -88,8 +89,42 @@ namespace TeamsCallingBot.Bot
         public void Dispose()
         {
             this.Client.Calls().OnUpdated -= this.CallsOnUpdated;
+            this.Client.Calls().OnIncoming -= this.CallsOnIncoming;
             this.Client?.Dispose();
             this.concurrentCallSlots.Dispose();
+        }
+
+        private IMediaSession CreateMediaSession()
+        {
+            return this.Client.CreateMediaSession(
+                new AudioSocketSettings
+                {
+                    StreamDirections = StreamDirection.Sendrecv,
+                    SupportedAudioFormat = AudioFormat.Pcm16K,
+                    ReceiveUnmixedMeetingAudio = true,
+                },
+                new[]
+                {
+                    new VideoSocketSettings
+                    {
+                        StreamDirections = StreamDirection.Sendrecv,
+                        ReceiveColorFormat = VideoColorFormat.NV12,
+                        SupportedSendVideoFormats = new List<VideoFormat>
+                        {
+                            VideoFormat.NV12_1280x720_15Fps,
+                            VideoFormat.NV12_640x360_15Fps,
+                            VideoFormat.NV12_1280x720_30Fps,
+                        },
+                    }
+                },
+                new VideoSocketSettings
+                {
+                    StreamDirections = StreamDirection.Recvonly,
+                    ReceiveColorFormat = VideoColorFormat.NV12,
+                    MediaType = MediaType.Vbss,
+                },
+                null,
+                mediaSessionId: Guid.NewGuid());
         }
 
         public async Task<ICall> JoinCallAsync(string meetingJoinUrl)
@@ -108,47 +143,15 @@ namespace TeamsCallingBot.Bot
             {
                 var (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
 
-                var mediaSession = this.Client.CreateMediaSession(
-                    new AudioSocketSettings
-                    {
-                        StreamDirections = StreamDirection.Sendrecv,
-                        SupportedAudioFormat = AudioFormat.Pcm16K,
-                        ReceiveUnmixedMeetingAudio = true,
-                    },
-                    new[]
-                    {
-                        new VideoSocketSettings
-                        {
-                            StreamDirections = StreamDirection.Sendrecv,
-                            ReceiveColorFormat = VideoColorFormat.NV12,
-                            // 15 fps formats: the status card is rendered in software, 15 fps halves the CPU
-                            // cost vs 30 fps and Teams picks the best one (PreferredVideoSourceFormat) for the
-                            // available bandwidth. CallHandler honours whichever Teams asks for.
-                            SupportedSendVideoFormats = new List<VideoFormat>
-                            {
-                                VideoFormat.NV12_1280x720_15Fps,
-                                VideoFormat.NV12_640x360_15Fps,
-                            },
-                        }
-                    },
-                    new VideoSocketSettings
-                    {
-                        StreamDirections = StreamDirection.Recvonly,
-                        ReceiveColorFormat = VideoColorFormat.NV12,
-                        MediaType = MediaType.Vbss,
-                    },
-                    null,
-                    mediaSessionId: Guid.NewGuid());
+                var mediaSession = this.CreateMediaSession();
 
                 var scenarioId = Guid.NewGuid();
 
                 // Confirmed real constructor - see class-level comment above.
                 var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
                 {
-                    // FIX (2026-09-04) for Graph error 7505 "Request authorization tenant mismatch":
-                    // this was never set, so the SDK never attached an "X-Microsoft-Tenant" hint to the
-                    // outbound request at all. See JoinInfo.ParseJoinURL's comment for the full traced
-                    // plumbing (confirmed via ildasm, not guessed) of exactly where this value goes.
+                    // Explicitly request to bypass lobby so bot is immediately admitted into the active meeting
+                    AllowGuestToBypassLobby = true,
                     TenantId = tenantId,
                 };
 
@@ -161,17 +164,6 @@ namespace TeamsCallingBot.Bot
                 }
                 catch (Exception ex)
                 {
-                    // FIX (2026-09-04): CallHandler's constructor (heartbeat/OnUpdated/AudioSocket
-                    // wiring) can throw for reasons independent of the join itself (e.g.
-                    // GetLocalMediaSession()/AudioSocket not synchronously populated yet) - AddAsync
-                    // above has ALREADY succeeded, so Graph now has a live call with ZERO tracking on
-                    // this side: no heartbeat, no OnUpdated subscription, no wind-down ever wired. Left
-                    // alone, that call sits orphaned on Graph's side, indistinguishable in logs from
-                    // "Graph silently ended it" when actually this process abandoned it. Confirmed real
-                    // via ildasm: ICall.DeleteAsync(bool handleHttpNotFoundInternally = false, ...)
-                    // exists - hang the call up explicitly instead of leaving it dangling. Best-effort:
-                    // the delete itself could also fail; that's logged and swallowed since the ORIGINAL
-                    // exception, not this cleanup attempt, is what should actually surface to the caller.
                     this.graphLogger.Error(ex, $"CallHandler construction failed for call {call.Id} - hanging up the now-orphaned Graph-side call.");
                     try
                     {
@@ -194,6 +186,42 @@ namespace TeamsCallingBot.Bot
             {
                 this.concurrentCallSlots.Release();
                 throw;
+            }
+        }
+
+        private void CallsOnIncoming(ICallCollection sender, CollectionEventArgs<ICall> args)
+        {
+            foreach (var call in args.AddedResources)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (!this.concurrentCallSlots.Wait(0))
+                        {
+                            this.graphLogger.Warn($"Rejecting incoming call {call.Id} - at concurrency cap.");
+                            return;
+                        }
+
+                        this.graphLogger.Info($"[Incoming Call] Detected incoming call {call.Id}. Answering with local media session...");
+                        Console.WriteLine($">>> [Incoming Call] Answering incoming call {call.Id} into meeting!");
+
+                        var mediaSession = this.CreateMediaSession();
+                        var scenarioId = Guid.NewGuid();
+                        await call.AnswerAsync(mediaSession, null, scenarioId).ConfigureAwait(false);
+
+                        var handler = new CallHandler(call, this.graphLogger, call.Resource.ChatInfo?.ThreadId, this.options?.OverrideBearerToken);
+                        this.CallHandlers[call.Id] = handler;
+                        this.graphLogger.Info($"[Incoming Call] Successfully answered call {call.Id} ({this.CallHandlers.Count} active calls now).");
+                        Console.WriteLine($">>> [Incoming Call] Successfully joined meeting via direct invite!");
+                    }
+                    catch (Exception ex)
+                    {
+                        this.concurrentCallSlots.Release();
+                        this.graphLogger.Error(ex, $"Failed to answer incoming call {call.Id}.");
+                        Console.WriteLine($">>> [Incoming Call Failed] {ex.Message}");
+                    }
+                });
             }
         }
 

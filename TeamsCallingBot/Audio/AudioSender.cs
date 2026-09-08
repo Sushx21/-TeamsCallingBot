@@ -28,6 +28,7 @@ namespace TeamsCallingBot.Audio
 
         public bool IsMuted { get; set; } = false;
         public bool IsAudioSendActive { get; private set; } = false;
+        public bool IsSpeaking { get; private set; } = false;
 
         public AudioSender(IAudioSocket audioSocket, IGraphLogger graphLogger)
         {
@@ -120,9 +121,20 @@ namespace TeamsCallingBot.Audio
             uint timestamp = 0;
             int offset = 0;
             var frameBuffer = new byte[BytesPerFrame];
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            long targetElapsedMs = 0;
+
+            const int poolSize = 16;
+            IntPtr[] audioPool = new IntPtr[poolSize];
+            for (int i = 0; i < poolSize; i++)
+            {
+                audioPool[i] = Marshal.AllocHGlobal(BytesPerFrame);
+            }
 
             try
             {
+                this.IsSpeaking = true;
+                int frameIndex = 0;
                 while (offset < pcmData.Length && !token.IsCancellationRequested)
                 {
                     if (this.IsMuted)
@@ -142,25 +154,37 @@ namespace TeamsCallingBot.Audio
 
                     if (this.IsAudioSendActive)
                     {
-                        // Allocate unmanaged memory specifically for this frame.
-                        // AudioSendBuffer.Dispose() calls Marshal.FreeHGlobal() on this pointer!
-                        IntPtr unmanaged = Marshal.AllocHGlobal(BytesPerFrame);
-                        Marshal.Copy(frameBuffer, 0, unmanaged, BytesPerFrame);
+                        int slot = frameIndex % poolSize;
+                        Marshal.Copy(frameBuffer, 0, audioPool[slot], BytesPerFrame);
 
-                        using (var audioMediaBuffer = new AudioSendBuffer(
-                            unmanaged,
+                        var audioMediaBuffer = new SafeAudioMediaBuffer(
+                            audioPool[slot],
                             (long)BytesPerFrame,
                             AudioFormat.Pcm16K,
-                            (long)timestamp))
-                        {
-                            this.audioSocket.Send(audioMediaBuffer);
-                        }
+                            (long)timestamp);
+
+                        this.audioSocket.Send(audioMediaBuffer);
                     }
 
+                    frameIndex++;
                     offset += BytesPerFrame;
                     timestamp += FrameDurationMs;
+                    targetElapsedMs += FrameDurationMs;
 
-                    await Task.Delay(FrameDurationMs, token).ConfigureAwait(false);
+                    // Drift-compensated pacing: ensure exactly 20ms of audio per 20ms real time
+                    long currentElapsedMs = stopwatch.ElapsedMilliseconds;
+                    int waitMs = (int)(targetElapsedMs - currentElapsedMs);
+                    if (waitMs > 1)
+                    {
+                        if (waitMs > 15)
+                        {
+                            await Task.Delay(waitMs - 8, token).ConfigureAwait(false);
+                        }
+                        while (stopwatch.ElapsedMilliseconds < targetElapsedMs && !token.IsCancellationRequested)
+                        {
+                            Thread.SpinWait(100);
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -170,6 +194,20 @@ namespace TeamsCallingBot.Audio
             catch (Exception ex)
             {
                 this.graphLogger?.Error(ex, "AudioSender: Error during audio frame playback.");
+            }
+            finally
+            {
+                this.IsSpeaking = false;
+                // Brief delay so native audio transport finishes transmitting before memory is freed
+                try { await Task.Delay(300).ConfigureAwait(false); } catch { }
+                for (int i = 0; i < poolSize; i++)
+                {
+                    if (audioPool[i] != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(audioPool[i]);
+                        audioPool[i] = IntPtr.Zero;
+                    }
+                }
             }
         }
 
@@ -219,7 +257,8 @@ namespace TeamsCallingBot.Audio
                 using (var ms = new MemoryStream())
                 {
                     SelectConfiguredVoice(synth, this.graphLogger);
-                    synth.Rate = -1; // slightly slower than default - clearer over a conference codec
+                    synth.Rate = 1; // Natural, clear and energetic tempo
+                    try { synth.SelectVoiceByHints(System.Speech.Synthesis.VoiceGender.Female); } catch { }
                     var format = new System.Speech.AudioFormat.SpeechAudioFormatInfo(SampleRate, System.Speech.AudioFormat.AudioBitsPerSample.Sixteen, System.Speech.AudioFormat.AudioChannel.Mono);
                     synth.SetOutputToAudioStream(ms, format);
                     synth.Speak(text);
@@ -231,6 +270,7 @@ namespace TeamsCallingBot.Audio
                     this.graphLogger?.Info($"[AudioSender] Speaking text: {text} ({pcmData.Length} bytes)");
                     Console.WriteLine($">>> [AudioSender] Speaking into call: \"{text}\"");
                     await PlayPcmBytesAsync(pcmData, cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($">>> [AudioSender] Finished speaking aloud into call: \"{text}\"");
                 }
             }
             catch (Exception ex)

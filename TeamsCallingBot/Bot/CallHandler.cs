@@ -2,12 +2,11 @@ namespace TeamsCallingBot.Bot
 {
     using System;
     using System.Collections.Generic;
-    using System.Diagnostics;
     using System.Drawing;
-    using System.IO;
     using System.Linq;
     using System.Net.Http;
     using System.Net.Http.Headers;
+    using System.Runtime.InteropServices;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
@@ -19,39 +18,28 @@ namespace TeamsCallingBot.Bot
     using Microsoft.Graph.Communications.Resources;
     using Microsoft.Skype.Bots.Media;
     using Newtonsoft.Json;
+    using Newtonsoft.Json.Linq;
     using TeamsCallingBot.Audio;
-    using TeamsCallingBot.Chat;
     using TeamsCallingBot.Common;
     using TeamsCallingBot.Config;
     using TeamsCallingBot.Storage;
-    using TeamsCallingBot.Tda;
     using TeamsCallingBot.Video;
 
     /// <summary>
     /// Complete call lifecycle handler supporting:
-    /// 1. Bidirectional Audio (Listen + Speak via AudioSender) - UNCHANGED, stable
+    /// 1. Bidirectional Audio (Listen + Speak via AudioSender)
     /// 2. Mute / Unmute
-    /// 3. Screen share (VBSS) + participant camera VIDEO RECORDING, per person, to MJPEG AVI files
-    ///    with periodic JPEG snapshots (see Video/VideoRecorder.cs and docs/VIDEO_RECORDING_AND_MOM.md)
-    /// 4. Disk Storage (Audio, Video, Snapshots, Transcripts, Timeline, Metadata) in one session folder
-    /// 5. Bot Video Broadcast (status card streamed into the meeting - resilient, never stops on error)
+    /// 3. Video Screen Sharing Photo Capture (from participants)
+    /// 4. Disk Storage (Audio, Photos, Transcripts, Metadata under D:\Teamsbot\Recordings\<SessionId>)
+    /// 5. Bot Video Broadcast (Streaming status card into meeting)
     /// 6. Auto Leave (Leaves after 30s when all human participants leave)
-    /// 7. Chat notifications via Bot Framework Connector (fallback: Graph chat API)
-    /// 8. Spoken greetings (configurable voice/culture, e.g. Indian English) + screen-share announcements
-    ///
-    /// VIDEO FIX (2026-09-04): the previous code subscribed the single VBSS socket to EVERY
-    /// participant's screen-share MSI in a loop, so the last participant in the roster won - usually
-    /// a viewer, not the presenter - and no frames ever arrived. Microsoft's PolicyRecordingBot sample
-    /// filters on stream Direction == SendOnly for VBSS (SendOnly/SendReceive for camera video); that
-    /// filter is now applied, per-participant OnUpdated events are wired so a share that starts
-    /// mid-call is noticed, and the socket is unsubscribed when the presenter stops sharing.
+    /// 7. Group Chat Notification if removed by user
     /// </summary>
     public class CallHandler : HeartbeatHandler
     {
         private int endHandled;
         private readonly IGraphLogger graphLogger;
         private readonly DateTime sessionStartTime;
-        private readonly BotOptions options;
 
         // Media Sockets
         private readonly IAudioSocket audioSocket;
@@ -62,66 +50,41 @@ namespace TeamsCallingBot.Bot
         public AudioSender AudioSender { get; }
         public AudioAggregator AudioAggregator { get; }
         public RecordingsManager RecordingsManager { get; }
-        public MeetingTimeline Timeline { get; }
 
         // State Flags
         public bool IsMuted { get; private set; } = false;
         private volatile bool isVideoSendActive = false;
+        private volatile bool isKeyFrameNeeded = true;
         private int joinWelcomeSent = 0;
-        private volatile bool callEstablished = false;
 
-        // Fallback photo throttling (only used when video recording is disabled)
-        private DateTime lastPhotoTime = DateTime.MinValue;
+        // Screen & Video Capture Throttling (independent throttles so screen capture isn't starved)
+        private DateTime lastVbssPhotoTime = DateTime.MinValue;
+        private DateTime lastVideoPhotoTime = DateTime.MinValue;
         private readonly TimeSpan photoInterval = TimeSpan.FromSeconds(5);
         private readonly object photoLock = new object();
         private Bitmap latestScreenBitmap = null;
 
-        // Video recording state (screen share + camera)
-        private readonly object videoLock = new object();
-        private VideoRecorder vbssRecorder;
-        private MediaSessionRecord vbssSession;
-        private uint currentVbssMsi;
-        private VideoRecorder cameraRecorder;
-        private MediaSessionRecord cameraSession;
-        private uint currentCameraMsi;
-        private int vbssMsiMismatchLogged;
-        private readonly HashSet<string> participantsWithUpdateHook = new HashSet<string>();
+        // Meeting Chat Polling & Dynamic Conversational Reply Loop
+        private CancellationTokenSource chatMonitorCts;
+        private readonly HashSet<string> processedChatMsgIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Bot Video Streaming
         private CancellationTokenSource videoBroadcastCts;
-        private readonly object sendLock = new object();
-        private volatile VideoFormat preferredSendFormat = VideoFormat.NV12_1280x720_15Fps;
-        private volatile string activityLine;
-        private int broadcastErrorsLogged;
 
         // Periodic Audio Flush
         private CancellationTokenSource periodicFlushCts;
 
-        // Auto-Leave Timer
+        // Auto-Leave Timer (Generous 10-minute grace period so bot stays alive and visible while waiting)
         private CancellationTokenSource autoLeaveCts;
-        private const int AutoLeaveDebounceSeconds = 30;
-        private const int InitialGracePeriodSeconds = 45;
+        private const int AutoLeaveDebounceSeconds = 120;
+        private const int InitialGracePeriodSeconds = 600;
 
         // Chat Info
         private readonly string chatThreadId;
         private readonly string botAccessToken;
-        private readonly BotFrameworkChatClient chatClient;
 
-        // TDA (Tata Steel Digital Assistant) integration - inert unless Bot:Tda:Enabled is true
-        // and all placeholder config values have been filled in. See Tda/TdaClient.cs.
-        private readonly TdaClient tdaClient;
-
-        // Active-speaker tracking (drives camera-follow, see SubscribeParticipantMediaStreams) -
-        // updated from OnAudioMediaReceived, which already gives us the speaking participant's MSI.
-        private volatile uint lastActiveSpeakerMsi;
-
-        // Bot video "visualization" mode (chart / TDA answer / image shown on the bot's own video
-        // tile instead of the status card) - see Video/VideoFrameConverter.CreateVisualizationFrame
-        // and BOT_CAPABILITY_EXPECTATIONS.md section 4. Off by default (currentVisualization null).
-        private readonly object visualizationLock = new object();
-        private Bitmap currentVisualization;
-        private string currentVisualizationTitle;
-        private DateTime visualizationExpiresAt = DateTime.MinValue;
+        // Real-Time Voice Speech Recognition
+        private readonly RealtimeSpeechRecognizer voiceRecognizer;
 
         public ICall Call { get; }
 
@@ -132,17 +95,11 @@ namespace TeamsCallingBot.Bot
             this.graphLogger = logger;
             this.sessionStartTime = DateTime.Now;
             this.chatThreadId = chatThreadId;
-            this.options = BotOptions.Current ?? new BotOptions();
-            this.botAccessToken = accessToken ?? this.options.OverrideBearerToken;
+            this.botAccessToken = accessToken ?? BotOptions.Current?.OverrideBearerToken;
 
             // 1. Initialize Disk Storage Manager
             this.RecordingsManager = new RecordingsManager(this.Call.Id);
             this.AudioAggregator = new AudioAggregator();
-            this.Timeline = new MeetingTimeline { CallId = this.Call.Id, ChatThreadId = chatThreadId, StartedAt = this.sessionStartTime };
-            this.chatClient = new BotFrameworkChatClient(this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.options.BotFrameworkServiceUrl, this.graphLogger);
-
-            var tdaTokenProvider = new TdaTokenProvider(this.options.Tda, this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.graphLogger);
-            this.tdaClient = new TdaClient(this.options.Tda, tdaTokenProvider, this.graphLogger);
 
             // 2. Wire Call Events
             this.Call.OnUpdated += this.OnCallUpdated;
@@ -152,7 +109,7 @@ namespace TeamsCallingBot.Bot
             var localMediaSession = this.Call.GetLocalMediaSession();
             if (localMediaSession != null)
             {
-                // Audio Socket (unchanged - stable)
+                // Audio Socket
                 this.audioSocket = localMediaSession.AudioSocket;
                 if (this.audioSocket != null)
                 {
@@ -160,27 +117,23 @@ namespace TeamsCallingBot.Bot
                     this.AudioSender = new AudioSender(this.audioSocket, this.graphLogger);
 
                     // Play pleasant greeting chime + verbal announcement when audio send is active
-                    if (this.options.SpeakGreetingOnJoin)
+                    _ = Task.Run(async () =>
                     {
-                        _ = Task.Run(async () =>
+                        for (int i = 0; i < 30; i++)
                         {
-                            for (int i = 0; i < 30; i++)
-                            {
-                                if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
-                                {
-                                    break;
-                                }
-                                await Task.Delay(200).ConfigureAwait(false);
-                            }
-
                             if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
                             {
-                                await Task.Delay(500).ConfigureAwait(false);
-                                await this.AudioSender.PlayGreetingAsync().ConfigureAwait(false);
-                                this.Timeline.AddEvent("bot_greeting_spoken", this.options.GreetingText);
+                                break;
                             }
-                        });
-                    }
+                            await Task.Delay(200).ConfigureAwait(false);
+                        }
+
+                        if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
+                        {
+                            await Task.Delay(500).ConfigureAwait(false);
+                            await this.AudioSender.PlayGreetingAsync().ConfigureAwait(false);
+                        }
+                    });
                 }
 
                 // VBSS (Screen Share Receive) Socket
@@ -189,15 +142,20 @@ namespace TeamsCallingBot.Bot
                 {
                     this.vbssSocket.VideoReceiveStatusChanged += this.OnVbssReceiveStatusChanged;
                     this.vbssSocket.VideoMediaReceived += this.OnVbssMediaReceived;
-                    this.vbssSocket.MediaStreamFailure += this.OnMediaStreamFailure;
-                    this.Log("[VBSS Socket] Initialised - waiting for a participant to start sharing (subscription happens per presenter MSI).");
-                }
-                else
-                {
-                    this.Log("[VBSS Socket] NOT available on this media session - screen share cannot be recorded.");
+
+                    try
+                    {
+                        this.vbssSocket.Subscribe(VideoResolution.HD1080p);
+                    }
+                    catch (Exception ex)
+                    {
+                        this.graphLogger.Warn($"Initial VBSS subscribe returned: {ex.Message}");
+                    }
+
+                    this.graphLogger.Info($"[VBSS Socket Initialized] Screen sharing photo capture is active.");
                 }
 
-                // Video Socket (Bot Video Streaming & participant camera receiving)
+                // Video Socket (Bot Video Streaming & Meeting Video Receiving)
                 if (localMediaSession.VideoSockets != null && localMediaSession.VideoSockets.Any())
                 {
                     this.videoSocket = localMediaSession.VideoSockets.First();
@@ -205,12 +163,11 @@ namespace TeamsCallingBot.Bot
                     this.videoSocket.VideoKeyFrameNeeded += this.OnVideoKeyFrameNeeded;
                     this.videoSocket.VideoReceiveStatusChanged += this.OnVideoReceiveStatusChanged;
                     this.videoSocket.VideoMediaReceived += this.OnVideoMediaReceived;
-                    this.videoSocket.MediaStreamFailure += this.OnMediaStreamFailure;
                     this.StartBotVideoBroadcast();
                 }
             }
 
-            // 4. Start Periodic Audio Disk Flush (every 10s so WAV files are continuously present on disk) - unchanged
+            // 4. Start Periodic Audio Disk Flush (every 10s so WAV files are continuously present on disk)
             this.periodicFlushCts = new CancellationTokenSource();
             _ = Task.Run(async () =>
             {
@@ -230,22 +187,27 @@ namespace TeamsCallingBot.Bot
                 }
             }, this.periodicFlushCts.Token);
 
-            // 5. Hook participants that are already in the roster
-            this.HookParticipantUpdates(this.Call.Participants);
+            // 5. Start Active Meeting Chat Monitor (replies to "tda bot", "hi", "kaise ho" in group chat + voice)
+            this.StartMeetingChatMonitor();
+
+            // 6. Start Real-Time Voice Speech Recognizer (replies to spoken voice: "tda bot", "kaise ho", etc.)
+            this.voiceRecognizer = new RealtimeSpeechRecognizer(
+                this.graphLogger,
+                () => this.AudioSender != null && this.AudioSender.IsSpeaking);
+            this.voiceRecognizer.OnTriggerDetected += this.OnVoiceTriggerDetected;
+
+            // Diagnostic: log what auth credentials are available for chat posting
+            string diagAppId = BotOptions.Current?.AadAppId ?? "(null)";
+            string diagSecret = string.IsNullOrWhiteSpace(BotOptions.Current?.AadAppSecretOrCertThumbprint) ? "(empty)" : $"({BotOptions.Current.AadAppSecretOrCertThumbprint.Length} chars)";
+            string diagOverride = string.IsNullOrWhiteSpace(BotOptions.Current?.OverrideBearerToken) ? "(empty)" : $"({BotOptions.Current.OverrideBearerToken.Length} chars)";
+            Console.WriteLine($">>> [Config Diagnostic] AppId={diagAppId}, Secret={diagSecret}, OverrideToken={diagOverride}");
 
             this.graphLogger.Info($"CallHandler initialized for {this.Call.Id}. Output folder: {this.RecordingsManager.SessionDirectory}");
             Console.WriteLine($">>> [CallHandler] Output folder: {this.RecordingsManager.SessionDirectory}");
         }
 
-        private void Log(string message)
-        {
-            this.graphLogger.Info(message);
-            Console.WriteLine(">>> " + message);
-            this.RecordingsManager.Log(message);
-        }
-
         // ===================================================================
-        // 1. Audio (Both Ways) - UNCHANGED
+        // 1. Audio (Both Ways)
         // ===================================================================
         private void OnAudioMediaReceived(object sender, AudioMediaReceivedEventArgs e)
         {
@@ -262,26 +224,13 @@ namespace TeamsCallingBot.Bot
                             speakerBuffer.Length,
                             speakerBuffer.OriginalSenderTimestamp);
 
-                        // Camera-follow-active-speaker (see SubscribeParticipantMediaStreams): the audio
-                        // MSI belongs to the same participant resource as their camera MSI, so tracking
-                        // "who is speaking right now" here is enough to prefer their camera stream below -
-                        // no separate dominant-speaker notification needed.
-                        if (speakerBuffer.ActiveSpeakerId != 0 && speakerBuffer.ActiveSpeakerId != AudioAggregator.UnknownSpeakerId
-                            && speakerBuffer.ActiveSpeakerId != this.lastActiveSpeakerMsi)
-                        {
-                            this.lastActiveSpeakerMsi = speakerBuffer.ActiveSpeakerId;
-                            if (this.options.RecordParticipantVideo)
-                            {
-                                // Off the audio media thread - SubscribeParticipantMediaStreams does Graph
-                                // resource lookups + socket (un)subscribe calls, must never block audio delivery.
-                                _ = Task.Run(() => this.SubscribeParticipantMediaStreams());
-                            }
-                        }
+                        this.voiceRecognizer?.AppendAudio(speakerBuffer.Data, speakerBuffer.Length);
                     }
                 }
                 else
                 {
                     this.AudioAggregator.Append(AudioAggregator.UnknownSpeakerId, e.Buffer.Data, e.Buffer.Length, e.Buffer.Timestamp);
+                    this.voiceRecognizer?.AppendAudio(e.Buffer.Data, e.Buffer.Length);
                 }
             }
             finally
@@ -342,26 +291,24 @@ namespace TeamsCallingBot.Bot
         }
 
         // ===================================================================
-        // 3. Screen share (VBSS) + camera video: subscription and recording
+        // 3. Video Screen Sharing & Meeting Video Capture (Photos)
         // ===================================================================
-        private void OnMediaStreamFailure(object sender, MediaStreamFailureEventArgs e)
-        {
-            this.Log($"[Video] MediaStreamFailure on socket {(sender as IVideoSocket)?.SocketId}: {e}");
-        }
-
         private void OnVbssReceiveStatusChanged(object sender, VideoReceiveStatusChangedEventArgs e)
         {
-            this.Log($"[VBSS Socket] VideoReceiveStatusChanged: {e.MediaReceiveStatus}");
-
-            if (e.MediaReceiveStatus == MediaReceiveStatus.Active)
+            this.graphLogger.Info($"[VBSS Socket] VideoReceiveStatusChanged: {e.MediaReceiveStatus}");
+            Console.WriteLine($">>> [VBSS Socket] VideoReceiveStatus: {e.MediaReceiveStatus}");
+            if (e.MediaReceiveStatus == MediaReceiveStatus.Active && this.vbssSocket != null)
             {
-                // Teams is ready to deliver frames - make sure we are subscribed to the current presenter.
-                this.SubscribeParticipantMediaStreams();
-            }
-            else
-            {
-                // The share ended (or the socket was torn down) - finalise the video file.
-                this.StopVbssRecorder("receive status Inactive");
+                try
+                {
+                    this.vbssSocket.Subscribe(VideoResolution.HD1080p);
+                    this.graphLogger.Info("[VBSS Socket] Subscribed to HD1080p screen share.");
+                    Console.WriteLine(">>> [VBSS Socket] Subscribed to HD1080p screen share.");
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Warn($"[VBSS Socket] Subscribe returned: {ex.Message}");
+                }
             }
         }
 
@@ -369,56 +316,71 @@ namespace TeamsCallingBot.Bot
         {
             try
             {
-                if (e.Buffer == null || e.Buffer.Data == IntPtr.Zero)
+                DateTime now = DateTime.Now;
+                bool shouldCapture = false;
+
+                lock (this.photoLock)
                 {
-                    return;
+                    if (now - this.lastVbssPhotoTime >= this.photoInterval)
+                    {
+                        this.lastVbssPhotoTime = now;
+                        shouldCapture = true;
+                    }
                 }
 
-                var recorder = this.vbssRecorder;
-                if (recorder != null && this.options.RecordScreenShare)
+                if (shouldCapture && e.Buffer.Data != IntPtr.Zero)
                 {
-                    if (e.Buffer.MediaSourceId != 0 && recorder.MediaSourceId != 0 && e.Buffer.MediaSourceId != recorder.MediaSourceId
-                        && Interlocked.Exchange(ref this.vbssMsiMismatchLogged, 1) == 0)
+                    Bitmap bitmap = null;
+                    if (e.Buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.NV12)
                     {
-                        this.Log($"[VBSS] Frames arrive with MSI {e.Buffer.MediaSourceId} but recorder was started for MSI {recorder.MediaSourceId} - recording them anyway.");
+                        bitmap = VideoFrameConverter.ConvertNV12ToBitmap(e.Buffer.Data, e.Buffer.VideoFormat.Width, e.Buffer.VideoFormat.Height, e.Buffer.Stride);
+                    }
+                    else if (e.Buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.Rgb24)
+                    {
+                        bitmap = VideoFrameConverter.ConvertRGB24ToBitmap(e.Buffer.Data, e.Buffer.VideoFormat.Width, e.Buffer.VideoFormat.Height, e.Buffer.Stride);
                     }
 
-                    recorder.OnFrame(e.Buffer); // copies bytes, returns immediately
-                    return;
-                }
+                    if (bitmap != null)
+                    {
+                        lock (this.photoLock)
+                        {
+                            this.latestScreenBitmap?.Dispose();
+                            this.latestScreenBitmap = (Bitmap)bitmap.Clone();
+                        }
 
-                if (recorder == null && this.options.RecordScreenShare)
-                {
-                    // Frames without a known presenter (e.g. subscription happened via ReceiveStatus before the
-                    // roster told us who shares) - start a recorder keyed by the MSI on the frame.
-                    var who = this.ResolveParticipantByMsi(e.Buffer.MediaSourceId);
-                    this.StartVbssRecorder(e.Buffer.MediaSourceId, who.DisplayName, who.ParticipantId);
-                    this.vbssRecorder?.OnFrame(e.Buffer);
-                    return;
+                        var savedPath = this.RecordingsManager.SavePhoto(bitmap, "03_photo_screenshare");
+                        this.graphLogger.Info($"[Screen Photo Saved] {savedPath}");
+                        Console.WriteLine($">>> [Screen Photo Saved] {savedPath}");
+                        bitmap.Dispose();
+                    }
                 }
-
-                this.SavePhotoThrottled(e.Buffer, "03_photo_screenshare");
             }
             catch (Exception ex)
             {
-                this.graphLogger.Error(ex, "Error handling screen share frame.");
+                this.graphLogger.Error(ex, "Error capturing screen share frame.");
             }
             finally
             {
-                e.Buffer?.Dispose();
+                e.Buffer.Dispose();
             }
         }
 
         private void OnVideoReceiveStatusChanged(object sender, VideoReceiveStatusChangedEventArgs e)
         {
-            this.Log($"[Video Socket] VideoReceiveStatusChanged: {e.MediaReceiveStatus}");
-            if (e.MediaReceiveStatus == MediaReceiveStatus.Active)
+            this.graphLogger.Info($"[Video Socket] VideoReceiveStatusChanged: {e.MediaReceiveStatus}");
+            Console.WriteLine($">>> [Video Socket] VideoReceiveStatus: {e.MediaReceiveStatus}");
+            if (e.MediaReceiveStatus == MediaReceiveStatus.Active && this.videoSocket != null)
             {
-                this.SubscribeParticipantMediaStreams();
-            }
-            else
-            {
-                this.StopCameraRecorder("receive status Inactive");
+                try
+                {
+                    this.videoSocket.Subscribe(VideoResolution.HD720p);
+                    this.graphLogger.Info("[Video Socket] Subscribed to HD720p meeting video.");
+                    Console.WriteLine(">>> [Video Socket] Subscribed to HD720p meeting video.");
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Warn($"[Video Socket] Subscribe returned: {ex.Message}");
+                }
             }
         }
 
@@ -426,420 +388,60 @@ namespace TeamsCallingBot.Bot
         {
             try
             {
-                if (e.Buffer == null || e.Buffer.Data == IntPtr.Zero)
+                DateTime now = DateTime.Now;
+                bool shouldCapture = false;
+
+                lock (this.photoLock)
                 {
-                    return;
+                    if (now - this.lastVideoPhotoTime >= this.photoInterval)
+                    {
+                        this.lastVideoPhotoTime = now;
+                        shouldCapture = true;
+                    }
                 }
 
-                var recorder = this.cameraRecorder;
-                if (recorder != null && this.options.RecordParticipantVideo)
+                if (shouldCapture && e.Buffer.Data != IntPtr.Zero)
                 {
-                    recorder.OnFrame(e.Buffer);
-                    return;
-                }
+                    Bitmap bitmap = null;
+                    if (e.Buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.NV12)
+                    {
+                        bitmap = VideoFrameConverter.ConvertNV12ToBitmap(e.Buffer.Data, e.Buffer.VideoFormat.Width, e.Buffer.VideoFormat.Height, e.Buffer.Stride);
+                    }
+                    else if (e.Buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.Rgb24)
+                    {
+                        bitmap = VideoFrameConverter.ConvertRGB24ToBitmap(e.Buffer.Data, e.Buffer.VideoFormat.Width, e.Buffer.VideoFormat.Height, e.Buffer.Stride);
+                    }
 
-                if (recorder == null && this.options.RecordParticipantVideo)
-                {
-                    var who = this.ResolveParticipantByMsi(e.Buffer.MediaSourceId);
-                    this.StartCameraRecorder(e.Buffer.MediaSourceId, who.DisplayName, who.ParticipantId);
-                    this.cameraRecorder?.OnFrame(e.Buffer);
-                    return;
-                }
+                    if (bitmap != null)
+                    {
+                        lock (this.photoLock)
+                        {
+                            this.latestScreenBitmap?.Dispose();
+                            this.latestScreenBitmap = (Bitmap)bitmap.Clone();
+                        }
 
-                this.SavePhotoThrottled(e.Buffer, "03_photo_video");
+                        var savedPath = this.RecordingsManager.SavePhoto(bitmap, "03_photo_video");
+                        this.graphLogger.Info($"[Meeting Video Photo Saved] {savedPath}");
+                        Console.WriteLine($">>> [Meeting Video Photo Saved] {savedPath}");
+                        bitmap.Dispose();
+                    }
+                }
             }
             catch (Exception ex)
             {
-                this.graphLogger.Error(ex, "Error handling meeting video frame.");
+                this.graphLogger.Error(ex, "Error capturing meeting video frame.");
             }
             finally
             {
-                e.Buffer?.Dispose();
-            }
-        }
-
-        /// <summary>Legacy behaviour (one JPEG every 5 s) - only used when video recording is switched off.</summary>
-        private void SavePhotoThrottled(VideoMediaBuffer buffer, string prefix)
-        {
-            DateTime now = DateTime.Now;
-            lock (this.photoLock)
-            {
-                if (now - this.lastPhotoTime < this.photoInterval)
-                {
-                    return;
-                }
-
-                this.lastPhotoTime = now;
-            }
-
-            Bitmap bitmap = null;
-            if (buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.NV12)
-            {
-                bitmap = VideoFrameConverter.ConvertNV12ToBitmap(buffer.Data, buffer.VideoFormat.Width, buffer.VideoFormat.Height, buffer.Stride);
-            }
-            else if (buffer.VideoFormat?.VideoColorFormat == VideoColorFormat.Rgb24)
-            {
-                bitmap = VideoFrameConverter.ConvertRGB24ToBitmap(buffer.Data, buffer.VideoFormat.Width, buffer.VideoFormat.Height, buffer.Stride);
-            }
-
-            if (bitmap == null)
-            {
-                return;
-            }
-
-            lock (this.photoLock)
-            {
-                this.latestScreenBitmap?.Dispose();
-                this.latestScreenBitmap = (Bitmap)bitmap.Clone();
-            }
-
-            var savedPath = this.RecordingsManager.SavePhoto(bitmap, prefix);
-            this.Log($"[Photo Saved] {savedPath}");
-            bitmap.Dispose();
-        }
-
-        /// <summary>
-        /// Looks at every participant's media streams and (un)subscribes the VBSS and video sockets so
-        /// they follow the CURRENT presenter / camera. Filter mirrors Microsoft's PolicyRecordingBot
-        /// sample: VBSS -> Modality.VideoBasedScreenSharing with Direction SendOnly (the presenter);
-        /// camera -> Modality.Video with Direction SendOnly or SendReceive.
-        /// </summary>
-        private void SubscribeParticipantMediaStreams()
-        {
-            try
-            {
-                if (this.Call?.Participants == null)
-                {
-                    return;
-                }
-
-                string botAppId = this.options.AadAppId;
-                uint sharerMsi = 0;
-                IParticipant sharer = null;
-                uint cameraMsi = 0;
-                IParticipant cameraOwner = null;
-
-                // Camera-follow-active-speaker: only one camera socket exists (SDK limitation - see
-                // BOT_CAPABILITY_EXPECTATIONS.md section 2/7), so when several participants are sending
-                // camera video, prefer whoever most recently spoke rather than an arbitrary "first found"
-                // participant. Falls back to first-found if no active speaker's camera is available.
-                string activeSpeakerParticipantId = this.ResolveParticipantByMsi(this.lastActiveSpeakerMsi).ParticipantId;
-                uint preferredCameraMsi = 0;
-                IParticipant preferredCameraOwner = null;
-
-                foreach (var participant in this.Call.Participants)
-                {
-                    var resource = participant.Resource;
-                    if (resource == null || resource.IsInLobby == true)
-                    {
-                        continue;
-                    }
-
-                    if (resource.Info?.Identity?.Application?.Id == botAppId)
-                    {
-                        continue;
-                    }
-
-                    var streams = resource.MediaStreams;
-                    if (streams == null)
-                    {
-                        continue;
-                    }
-
-                    foreach (var stream in streams)
-                    {
-                        if (!uint.TryParse(stream.SourceId, out uint msi) || msi == 0)
-                        {
-                            continue;
-                        }
-
-                        bool sendCapable = stream.Direction == MediaDirection.SendOnly || stream.Direction == MediaDirection.SendReceive;
-                        if (!sendCapable)
-                        {
-                            continue;
-                        }
-
-                        if (stream.MediaType == Modality.VideoBasedScreenSharing && sharer == null)
-                        {
-                            sharer = participant;
-                            sharerMsi = msi;
-                        }
-                        else if (stream.MediaType == Modality.Video)
-                        {
-                            if (cameraOwner == null)
-                            {
-                                cameraOwner = participant;
-                                cameraMsi = msi;
-                            }
-
-                            if (preferredCameraOwner == null && activeSpeakerParticipantId != null && participant.Id == activeSpeakerParticipantId)
-                            {
-                                preferredCameraOwner = participant;
-                                preferredCameraMsi = msi;
-                            }
-                        }
-                    }
-                }
-
-                if (preferredCameraOwner != null)
-                {
-                    cameraOwner = preferredCameraOwner;
-                    cameraMsi = preferredCameraMsi;
-                }
-
-                // ---- Screen share -------------------------------------------------------------
-                if (this.vbssSocket != null)
-                {
-                    if (sharerMsi != 0 && sharerMsi != this.currentVbssMsi)
-                    {
-                        string name = GetDisplayName(sharer);
-                        try
-                        {
-                            this.vbssSocket.Subscribe(VideoResolution.HD1080p, sharerMsi);
-                            this.currentVbssMsi = sharerMsi;
-                            this.Log($"[VBSS Socket] Subscribed to screen share of '{name}' (MSI {sharerMsi}).");
-                        }
-                        catch (Exception ex)
-                        {
-                            this.Log($"[VBSS Socket] Subscribe to MSI {sharerMsi} failed: {ex.Message}");
-                        }
-
-                        if (this.options.RecordScreenShare)
-                        {
-                            this.StartVbssRecorder(sharerMsi, name, sharer?.Id);
-                        }
-                    }
-                    else if (sharerMsi == 0 && this.currentVbssMsi != 0)
-                    {
-                        this.Log($"[VBSS Socket] Presenter (MSI {this.currentVbssMsi}) stopped sharing - unsubscribing.");
-                        try
-                        {
-                            this.vbssSocket.Unsubscribe();
-                        }
-                        catch (Exception ex)
-                        {
-                            this.graphLogger.Warn($"[VBSS Socket] Unsubscribe returned: {ex.Message}");
-                        }
-
-                        this.currentVbssMsi = 0;
-                        this.StopVbssRecorder("presenter stopped sharing");
-                    }
-                }
-
-                // ---- Camera video ---------------------------------------------------------------
-                if (this.videoSocket != null)
-                {
-                    if (cameraMsi != 0 && cameraMsi != this.currentCameraMsi)
-                    {
-                        string name = GetDisplayName(cameraOwner);
-                        try
-                        {
-                            this.videoSocket.Subscribe(VideoResolution.HD720p, cameraMsi);
-                            this.currentCameraMsi = cameraMsi;
-                            this.Log($"[Video Socket] Subscribed to camera of '{name}' (MSI {cameraMsi}).");
-                        }
-                        catch (Exception ex)
-                        {
-                            this.Log($"[Video Socket] Subscribe to MSI {cameraMsi} failed: {ex.Message}");
-                        }
-
-                        if (this.options.RecordParticipantVideo)
-                        {
-                            this.StartCameraRecorder(cameraMsi, name, cameraOwner?.Id);
-                        }
-                    }
-                    else if (cameraMsi == 0 && this.currentCameraMsi != 0)
-                    {
-                        this.Log($"[Video Socket] Camera (MSI {this.currentCameraMsi}) switched off - unsubscribing.");
-                        try
-                        {
-                            this.videoSocket.Unsubscribe();
-                        }
-                        catch (Exception ex)
-                        {
-                            this.graphLogger.Warn($"[Video Socket] Unsubscribe returned: {ex.Message}");
-                        }
-
-                        this.currentCameraMsi = 0;
-                        this.StopCameraRecorder("camera switched off");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Warn($"Error subscribing participant media streams: {ex.Message}");
-            }
-        }
-
-        private VideoRecorderSettings ScreenShareRecorderSettings() => new VideoRecorderSettings
-        {
-            Fps = Math.Max(1, this.options.ScreenShareRecordingFps),
-            JpegQuality = this.options.VideoJpegQuality,
-            SnapshotIntervalSeconds = Math.Max(1, this.options.SnapshotIntervalSeconds),
-            MaxSegmentBytes = Math.Max(50_000_000, this.options.MaxVideoSegmentBytes),
-            SnapshotPrefix = "03_snapshot_screenshare",
-        };
-
-        private VideoRecorderSettings CameraRecorderSettings() => new VideoRecorderSettings
-        {
-            Fps = Math.Max(1, this.options.ParticipantVideoRecordingFps),
-            JpegQuality = this.options.VideoJpegQuality,
-            SnapshotIntervalSeconds = Math.Max(5, this.options.SnapshotIntervalSeconds * 3),
-            MaxSegmentBytes = Math.Max(50_000_000, this.options.MaxVideoSegmentBytes),
-            SnapshotPrefix = "03_snapshot_camera",
-        };
-
-        private void StartVbssRecorder(uint msi, string presenterName, string participantId)
-        {
-            lock (this.videoLock)
-            {
-                if (this.vbssRecorder != null && this.vbssRecorder.MediaSourceId == msi)
-                {
-                    return;
-                }
-
-                this.StopVbssRecorderCore("new presenter");
-
-                string stem = $"03_video_screenshare_{VideoRecorder.SanitizeFileName(presenterName)}_{DateTime.Now:HHmmss}";
-                var recorder = new VideoRecorder(this.RecordingsManager.SessionDirectory, stem, msi, presenterName, this.ScreenShareRecorderSettings(), this.RecordingsManager.Log);
-                recorder.SnapshotSaved += (r, snap) => this.graphLogger.Info($"[Screen Snapshot Saved] {snap.Path}");
-                recorder.Start();
-
-                this.vbssRecorder = recorder;
-                this.vbssSession = this.Timeline.StartScreenShare(msi, presenterName, participantId);
-                this.activityLine = $"Recording {presenterName}'s screen share";
-                Interlocked.Exchange(ref this.vbssMsiMismatchLogged, 0);
-            }
-
-            this.Log($"[Screen Recording] Started for '{presenterName}' (MSI {msi}).");
-
-            if (this.options.AnnounceScreenShare)
-            {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        _ = this.PostTextMessageToChatAsync($"🎥 <b>Recording started:</b> {System.Net.WebUtility.HtmlEncode(presenterName)}'s screen share is now being recorded.");
-                        if (this.AudioSender != null && !this.IsMuted)
-                        {
-                            await this.AudioSender.SpeakAsync($"I have started recording {presenterName}'s screen share.").ConfigureAwait(false);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        this.graphLogger.Warn($"[Screen Recording] Announcement failed: {ex.Message}");
-                    }
-                });
-            }
-        }
-
-        private void StopVbssRecorder(string reason)
-        {
-            lock (this.videoLock)
-            {
-                this.StopVbssRecorderCore(reason);
-            }
-        }
-
-        private void StopVbssRecorderCore(string reason)
-        {
-            var recorder = this.vbssRecorder;
-            if (recorder == null)
-            {
-                return;
-            }
-
-            this.vbssRecorder = null;
-            this.activityLine = null;
-            try
-            {
-                recorder.Stop();
-                this.Timeline.EndMediaSession(this.vbssSession, recorder.SegmentPaths, recorder.Snapshots.Select(s => s.Path), recorder.FramesWritten);
-                this.Log($"[Screen Recording] Stopped for '{recorder.SourceLabel}' ({reason}): {recorder.FramesWritten} frames written from {recorder.FramesReceived} received -> {string.Join(", ", recorder.SegmentPaths.Select(Path.GetFileName))}");
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Error(ex, "[Screen Recording] Error while stopping recorder.");
-            }
-            finally
-            {
-                recorder.Dispose();
-                this.vbssSession = null;
-            }
-        }
-
-        private void StartCameraRecorder(uint msi, string participantName, string participantId)
-        {
-            lock (this.videoLock)
-            {
-                if (this.cameraRecorder != null && this.cameraRecorder.MediaSourceId == msi)
-                {
-                    return;
-                }
-
-                this.StopCameraRecorderCore("new camera source");
-
-                string stem = $"03_video_camera_{VideoRecorder.SanitizeFileName(participantName)}_{DateTime.Now:HHmmss}";
-                var recorder = new VideoRecorder(this.RecordingsManager.SessionDirectory, stem, msi, participantName, this.CameraRecorderSettings(), this.RecordingsManager.Log);
-                recorder.Start();
-                this.cameraRecorder = recorder;
-                this.cameraSession = this.Timeline.StartCameraSession(msi, participantName, participantId);
-            }
-
-            this.Log($"[Camera Recording] Started for '{participantName}' (MSI {msi}).");
-        }
-
-        private void StopCameraRecorder(string reason)
-        {
-            lock (this.videoLock)
-            {
-                this.StopCameraRecorderCore(reason);
-            }
-        }
-
-        private void StopCameraRecorderCore(string reason)
-        {
-            var recorder = this.cameraRecorder;
-            if (recorder == null)
-            {
-                return;
-            }
-
-            this.cameraRecorder = null;
-            try
-            {
-                recorder.Stop();
-                this.Timeline.EndMediaSession(this.cameraSession, recorder.SegmentPaths, recorder.Snapshots.Select(s => s.Path), recorder.FramesWritten);
-                this.Log($"[Camera Recording] Stopped for '{recorder.SourceLabel}' ({reason}): {recorder.FramesWritten} frames -> {string.Join(", ", recorder.SegmentPaths.Select(Path.GetFileName))}");
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Error(ex, "[Camera Recording] Error while stopping recorder.");
-            }
-            finally
-            {
-                recorder.Dispose();
-                this.cameraSession = null;
+                e.Buffer.Dispose();
             }
         }
 
         /// <summary>
-        /// Instantly saves a photo of the current active screen share (or meeting video) on demand.
+        /// Instantly saves a photo of the current active screen share or meeting video on demand.
         /// </summary>
         public string CapturePhotoNow(string tag = "manual")
         {
-            var recorder = this.vbssRecorder ?? this.cameraRecorder;
-            if (recorder != null)
-            {
-                string path = Path.Combine(this.RecordingsManager.SessionDirectory, $"03_photo_{tag}_{DateTime.Now:yyyyMMdd_HHmmss_fff}.jpg");
-                var saved = recorder.SaveLatestFrame(path);
-                if (saved != null)
-                {
-                    this.RecordingsManager.Log($"[Photo Saved] {saved}");
-                    return saved;
-                }
-            }
-
             lock (this.photoLock)
             {
                 if (this.latestScreenBitmap != null)
@@ -847,69 +449,23 @@ namespace TeamsCallingBot.Bot
                     return this.RecordingsManager.SavePhoto(this.latestScreenBitmap, $"03_photo_{tag}");
                 }
             }
-
             return null;
         }
 
-        /// <summary>Summary of the active/finished video recordings for the management API.</summary>
-        public object GetVideoStatus()
-        {
-            var vbss = this.vbssRecorder;
-            var cam = this.cameraRecorder;
-            return new
-            {
-                ScreenShare = vbss == null ? null : new
-                {
-                    Presenter = vbss.SourceLabel,
-                    Msi = vbss.MediaSourceId,
-                    StartedAt = vbss.StartedAt,
-                    Resolution = $"{vbss.Width}x{vbss.Height}",
-                    FramesReceived = vbss.FramesReceived,
-                    FramesWritten = vbss.FramesWritten,
-                    Files = vbss.SegmentPaths,
-                    Snapshots = vbss.Snapshots.Count,
-                },
-                Camera = cam == null ? null : new
-                {
-                    Participant = cam.SourceLabel,
-                    Msi = cam.MediaSourceId,
-                    StartedAt = cam.StartedAt,
-                    Resolution = $"{cam.Width}x{cam.Height}",
-                    FramesReceived = cam.FramesReceived,
-                    FramesWritten = cam.FramesWritten,
-                    Files = cam.SegmentPaths,
-                },
-                CompletedScreenShareSessions = this.Timeline.ScreenShareSessions.Where(s => s.EndedAt != null).Select(s => new { s.PresenterName, s.StartedAt, s.EndedAt, s.VideoFiles, SnapshotCount = s.SnapshotFiles.Count }),
-                BotVideoSendActive = this.isVideoSendActive,
-                BotVideoFormat = this.preferredSendFormat?.ToString(),
-            };
-        }
-
         // ===================================================================
-        // 5. Video Sharing by Bot (status card)
+        // 5. Video Sharing by Bot
         // ===================================================================
         private void OnVideoSendStatusChanged(object sender, VideoSendStatusChangedEventArgs e)
         {
-            var preferred = e.PreferredVideoSourceFormat;
-            if (preferred != null && preferred.VideoColorFormat == VideoColorFormat.NV12 && preferred.Width > 0 && preferred.Height > 0)
-            {
-                this.preferredSendFormat = preferred;
-            }
-
             this.isVideoSendActive = (e.MediaSendStatus == MediaSendStatus.Active);
-            this.Log($"[VideoSocket] VideoSendStatusChanged: {e.MediaSendStatus}, preferred format: {preferred}");
-
-            if (this.isVideoSendActive)
-            {
-                // Push a frame right away so the tile appears immediately instead of waiting for the next tick.
-                _ = Task.Run(() => this.SendCardFrame(0));
-            }
+            this.graphLogger.Info($"[VideoSocket] VideoSendStatusChanged: {e.MediaSendStatus}");
+            Console.WriteLine($">>> [VideoSocket] VideoSendStatus: {e.MediaSendStatus}");
         }
 
         private void OnVideoKeyFrameNeeded(object sender, VideoKeyFrameNeededEventArgs e)
         {
-            this.graphLogger.Info("[VideoSocket] KeyFrameNeeded - sending a fresh frame.");
-            _ = Task.Run(() => this.SendCardFrame(0));
+            this.isKeyFrameNeeded = true;
+            this.graphLogger.Info("[VideoSocket] KeyFrameNeeded");
         }
 
         private void StartBotVideoBroadcast()
@@ -921,288 +477,132 @@ namespace TeamsCallingBot.Bot
 
             _ = Task.Run(async () =>
             {
+                int width = 1280;
+                int height = 720;
+                int frameRate = 15; // 15 FPS
+                int frameDelayMs = 1000 / frameRate;
+                uint timestamp = 0;
                 int tick = 0;
                 bool snapshotSaved = false;
-                var pace = Stopwatch.StartNew();
+                bool loggedFirstSend = false;
+                bool loggedFirstError = false;
+                int consecutiveErrors = 0;
+                int bufSize = width * height * 3 / 2; // 1,382,400 bytes for NV12 1280x720
 
-                while (!token.IsCancellationRequested)
+                // CRITICAL STABILITY FIX: Pre-allocate a pool of 6 unmanaged video frame buffers (8.3 MB total).
+                // Standard VideoSendBuffer calls Marshal.FreeHGlobal() immediately upon Dispose(), which causes
+                // native video encoder worker threads in mpencoder.dll / MediaApi.dll to access freed memory
+                // and crash the process with Access Violation (0xc0000005).
+                // With SafeVideoMediaBuffer and a ring buffer pool, each slot has 6 * 66ms = 400ms safety
+                // window for the native encoder to finish reading the frame before the slot is reused.
+                const int poolSize = 6;
+                IntPtr[] videoBufferPool = new IntPtr[poolSize];
+                for (int i = 0; i < poolSize; i++)
                 {
-                    tick++;
-                    var format = this.preferredSendFormat ?? VideoFormat.NV12_1280x720_15Fps;
-                    int frameDelayMs = (int)Math.Max(33, 1000 / Math.Max(1f, format.FrameRate));
-
-                    try
-                    {
-                        if (!snapshotSaved)
-                        {
-                            snapshotSaved = true;
-                            using (var card = this.RenderCurrentBotFrame(tick))
-                            {
-                                this.RecordingsManager.SavePhoto(card, "05_bot_broadcast_preview");
-                            }
-                        }
-
-                        if (this.isVideoSendActive)
-                        {
-                            this.SendCardFrame(tick);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // IMPORTANT: never let one failed Send() kill the loop - that is exactly how the bot's
-                        // tile used to "disappear" for the rest of the meeting.
-                        if (Interlocked.Increment(ref this.broadcastErrorsLogged) <= 5)
-                        {
-                            this.graphLogger.Warn($"[Bot Video] Frame send failed (loop continues): {ex.Message}");
-                        }
-                    }
-
-                    // Pace against the wall clock so render time does not accumulate into drift.
-                    long elapsed = pace.ElapsedMilliseconds;
-                    int wait = (int)Math.Max(1, frameDelayMs - elapsed);
-                    pace.Restart();
-                    try
-                    {
-                        await Task.Delay(wait, token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
+                    videoBufferPool[i] = Marshal.AllocHGlobal(bufSize);
                 }
 
-                this.graphLogger.Info("[Bot Video Streaming] Broadcast loop stopped.");
-            }, token);
-
-            this.graphLogger.Info("[Bot Video Streaming] Broadcast loop initialized.");
-        }
-
-        /// <summary>Renders the status card at the negotiated format and sends one NV12 frame.</summary>
-        private void SendCardFrame(int tick)
-        {
-            if (!this.isVideoSendActive || this.videoSocket == null)
-            {
-                return;
-            }
-
-            var format = this.preferredSendFormat ?? VideoFormat.NV12_1280x720_15Fps;
-
-            lock (this.sendLock)
-            {
-                if (!this.isVideoSendActive)
-                {
-                    return;
-                }
+                // Wait for call to be established before sending frames
+                await Task.Delay(2000, token).ConfigureAwait(false);
 
                 try
                 {
-                    using (var card = this.RenderCurrentBotFrame(tick))
+                    while (!token.IsCancellationRequested)
                     {
-                        byte[] nv12 = VideoFrameConverter.ConvertBitmapToNV12(card, format.Width, format.Height);
+                        tick++;
 
-                        // VideoSendBuffer(byte[]) copies into its own unmanaged buffer and frees it on Dispose.
-                        // Timestamp must come from the media platform clock (100-ns units), not a 0-based counter.
-                        using (var videoBuffer = new VideoSendBuffer(nv12, (uint)nv12.Length, format, MediaPlatform.GetCurrentTimestamp()))
+                        // Generate dynamic status card with prominent bot icon, waveform bars, and status
+                        using (var card = VideoFrameConverter.CreateBotStatusCard(
+                            "Teams AI Assistant",
+                            this.IsMuted ? "Muted" : "Active & Listening",
+                            this.Call.Id,
+                            this.IsMuted,
+                            tick))
                         {
-                            this.videoSocket.Send(videoBuffer);
+                            // Save a single preview snapshot of the bot broadcast card on start
+                            if (!snapshotSaved)
+                            {
+                                snapshotSaved = true;
+                                this.RecordingsManager.SavePhoto(card, "05_bot_broadcast_preview");
+                            }
+
+                            if (this.isKeyFrameNeeded)
+                            {
+                                this.isKeyFrameNeeded = false;
+                            }
+
+                            byte[] nv12Bytes = VideoFrameConverter.ConvertBitmapToNV12(card, width, height);
+
+                            try
+                            {
+                                int slot = tick % poolSize;
+                                Marshal.Copy(nv12Bytes, 0, videoBufferPool[slot], bufSize);
+
+                                var videoBuffer = new SafeVideoMediaBuffer(
+                                    videoBufferPool[slot],
+                                    bufSize,
+                                    VideoFormat.NV12_1280x720_30Fps,
+                                    (long)timestamp);
+
+                                this.videoSocket.Send(videoBuffer);
+
+                                consecutiveErrors = 0;
+                                if (!loggedFirstSend)
+                                {
+                                    loggedFirstSend = true;
+                                    Console.WriteLine($">>> [Bot Video] First frame sent successfully at tick {tick}! Bot should now be visible.");
+                                    this.graphLogger.Info($"[Bot Video] First frame sent successfully at tick {tick}.");
+                                }
+                            }
+                            catch (Exception sendEx)
+                            {
+                                consecutiveErrors++;
+                                if (!loggedFirstError)
+                                {
+                                    loggedFirstError = true;
+                                    Console.WriteLine($">>> [Bot Video] Send attempt failed (will keep retrying): {sendEx.GetType().Name}: {sendEx.Message}");
+                                }
+                                // After initial errors, slow down to avoid spamming
+                                if (consecutiveErrors > 30 && consecutiveErrors % 100 == 0)
+                                {
+                                    Console.WriteLine($">>> [Bot Video] Still retrying... ({consecutiveErrors} consecutive send failures, isVideoSendActive={this.isVideoSendActive})");
+                                }
+                            }
+                        }
+
+                        timestamp += (uint)frameDelayMs;
+                        await Task.Delay(frameDelayMs, token).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Error(ex, "Error in bot video broadcast loop.");
+                    Console.WriteLine($">>> [Bot Video] FATAL broadcast loop error: {ex.Message}");
+                }
+                finally
+                {
+                    // Clean up unmanaged video buffers when broadcast loop exits
+                    for (int i = 0; i < poolSize; i++)
+                    {
+                        if (videoBufferPool[i] != IntPtr.Zero)
+                        {
+                            Marshal.FreeHGlobal(videoBufferPool[i]);
+                            videoBufferPool[i] = IntPtr.Zero;
                         }
                     }
                 }
-                catch (Exception ex)
-                {
-                    if (Interlocked.Increment(ref this.broadcastErrorsLogged) <= 5)
-                    {
-                        this.graphLogger.Warn($"[Bot Video] Send failed: {ex.Message}");
-                    }
-                }
-            }
-        }
+            }, token);
 
-        /// <summary>
-        /// Picks between the normal status card and an active visualization (chart / TDA answer /
-        /// image shown on the bot's own video tile - see ShowVisualizationAsync). Caller owns and
-        /// must Dispose the returned Bitmap.
-        /// </summary>
-        private Bitmap RenderCurrentBotFrame(int tick)
-        {
-            Bitmap visualization = null;
-            string title = null;
-            lock (this.visualizationLock)
-            {
-                if (this.currentVisualization != null && DateTime.Now < this.visualizationExpiresAt)
-                {
-                    visualization = this.currentVisualization;
-                    title = this.currentVisualizationTitle;
-                }
-                else if (this.currentVisualization != null)
-                {
-                    // Expired - clear it so subsequent frames fall back to the status card.
-                    this.currentVisualization.Dispose();
-                    this.currentVisualization = null;
-                    this.currentVisualizationTitle = null;
-                }
-            }
-
-            if (visualization != null)
-            {
-                return VideoFrameConverter.CreateVisualizationFrame(visualization, title);
-            }
-
-            return VideoFrameConverter.CreateBotStatusCard(
-                "Teams AI Assistant",
-                this.IsMuted ? "Audio output muted - still recording" : "Recording audio and video",
-                this.Call.Id,
-                this.IsMuted,
-                tick,
-                this.activityLine);
-        }
-
-        /// <summary>
-        /// Shows <paramref name="contentImage"/> on the bot's outgoing video tile for
-        /// <paramref name="durationSeconds"/> seconds (0 or negative = show indefinitely until
-        /// ClearVisualization or a new call to this method). Takes ownership of contentImage (clones
-        /// it internally, caller may dispose its own copy). This is the "share screen to show
-        /// visualisation" capability - see BOT_CAPABILITY_EXPECTATIONS.md section 4, option (a).
-        /// </summary>
-        public void ShowVisualization(Bitmap contentImage, string title, int durationSeconds)
-        {
-            if (contentImage == null)
-            {
-                return;
-            }
-
-            var clone = (Bitmap)contentImage.Clone();
-            lock (this.visualizationLock)
-            {
-                this.currentVisualization?.Dispose();
-                this.currentVisualization = clone;
-                this.currentVisualizationTitle = title;
-                this.visualizationExpiresAt = durationSeconds > 0
-                    ? DateTime.Now.AddSeconds(durationSeconds)
-                    : DateTime.MaxValue;
-            }
-
-            this.Log($"[Visualization] Showing '{title}' on bot video tile" + (durationSeconds > 0 ? $" for {durationSeconds}s." : " indefinitely."));
-        }
-
-        /// <summary>Reverts the bot's video tile to the normal status card immediately.</summary>
-        public void ClearVisualization()
-        {
-            lock (this.visualizationLock)
-            {
-                this.currentVisualization?.Dispose();
-                this.currentVisualization = null;
-                this.currentVisualizationTitle = null;
-                this.visualizationExpiresAt = DateTime.MinValue;
-            }
+            this.graphLogger.Info("[Bot Video Streaming] Broadcast loop initialized at 15 FPS.");
         }
 
         // ===================================================================
-        // TDA (Tata Steel Digital Assistant) integration - inert unless Bot:Tda:Enabled is true.
-        // See Config/BotOptions.cs (TdaOptions) and Tda/TdaClient.cs.
-        // ===================================================================
-
-        /// <summary>
-        /// Asks TDA <paramref name="query"/> and speaks the answer into the meeting. No-ops (logs and
-        /// returns false) if TDA is not configured/enabled, if AudioSender is unavailable, or if TDA
-        /// returns nothing - never throws into the caller.
-        /// </summary>
-        public async Task<bool> SpeakTdaAnswerAsync(string query)
-        {
-            if (!this.tdaClient.IsConfigured)
-            {
-                this.graphLogger.Warn("[TDA] SpeakTdaAnswerAsync called but TDA is not enabled/configured - no-op.");
-                return false;
-            }
-
-            try
-            {
-                string answer = await this.tdaClient.AskAsync(query).ConfigureAwait(false);
-                if (string.IsNullOrWhiteSpace(answer))
-                {
-                    return false;
-                }
-
-                if (this.AudioSender != null && !this.IsMuted)
-                {
-                    await this.AudioSender.SpeakAsync(answer).ConfigureAwait(false);
-                }
-
-                this.Timeline.AddEvent("tda_answer_spoken", answer);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Warn($"[TDA] SpeakTdaAnswerAsync failed: {ex.Message}");
-                return false;
-            }
-        }
-
-        /// <summary>Sends a message to TDA using a token scoped to the "TSL AI" resource. False/no-op if not configured.</summary>
-        public async Task<bool> SendTdaMessageAsync(string message)
-        {
-            if (!this.tdaClient.IsConfigured)
-            {
-                this.graphLogger.Warn("[TDA] SendTdaMessageAsync called but TDA is not enabled/configured - no-op.");
-                return false;
-            }
-
-            try
-            {
-                return await this.tdaClient.SendMessageAsync(message).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Warn($"[TDA] SendTdaMessageAsync failed: {ex.Message}");
-                return false;
-            }
-        }
-
-        // ===================================================================
-        // 6. Participants: roster tracking, greetings, auto leave
+        // 6. Auto Leave
         // ===================================================================
         private void OnParticipantsUpdated(IParticipantCollection sender, CollectionEventArgs<IParticipant> args)
         {
-            string botAppId = this.options.AadAppId;
-
-            foreach (var added in args.AddedResources)
-            {
-                bool isBot = added.Resource?.Info?.Identity?.Application?.Id == botAppId;
-                string name = GetDisplayName(added);
-                this.Timeline.ParticipantJoined(added.Id, name, added.Resource?.Info?.Identity?.User?.Id, isBot);
-
-                if (!isBot && added.Resource?.IsInLobby != true && this.options.GreetParticipantsByName && this.callEstablished
-                    && (DateTime.Now - this.sessionStartTime).TotalSeconds > 20)
-                {
-                    var greetName = name;
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await Task.Delay(2500).ConfigureAwait(false); // let their client connect audio first
-                            if (this.AudioSender != null && !this.IsMuted)
-                            {
-                                await this.AudioSender.SpeakAsync($"Hi {FirstName(greetName)}, welcome to the meeting.").ConfigureAwait(false);
-                            }
-                        }
-                        catch { }
-                    });
-                }
-            }
-
-            foreach (var removed in args.RemovedResources)
-            {
-                this.Timeline.ParticipantLeft(removed.Id);
-                lock (this.participantsWithUpdateHook)
-                {
-                    if (this.participantsWithUpdateHook.Remove(removed.Id))
-                    {
-                        try { removed.OnUpdated -= this.OnParticipantUpdated; } catch { }
-                    }
-                }
-            }
-
-            this.HookParticipantUpdates(args.AddedResources);
+            string botAppId = BotOptions.Current?.AadAppId;
 
             // Count participants who are in the meeting (not in lobby, and not this bot)
             int humanCount = this.Call.Participants.Count(p =>
@@ -1265,106 +665,78 @@ namespace TeamsCallingBot.Bot
             }
         }
 
-        /// <summary>
-        /// A participant starting/stopping a share changes THAT participant's resource (its mediaStreams),
-        /// which raises IParticipant.OnUpdated - not the collection's OnUpdated. Without this hook a share
-        /// that begins mid-meeting is never noticed. (Same pattern as Microsoft's PolicyRecordingBot.)
-        /// </summary>
-        private void HookParticipantUpdates(IEnumerable<IParticipant> participants)
-        {
-            if (participants == null)
-            {
-                return;
-            }
-
-            foreach (var participant in participants)
-            {
-                lock (this.participantsWithUpdateHook)
-                {
-                    if (!this.participantsWithUpdateHook.Add(participant.Id))
-                    {
-                        continue;
-                    }
-                }
-
-                participant.OnUpdated += this.OnParticipantUpdated;
-            }
-        }
-
-        private void OnParticipantUpdated(IParticipant sender, ResourceEventArgs<Participant> args)
+        private void SubscribeParticipantMediaStreams()
         {
             try
             {
-                var streams = args.NewResource?.MediaStreams;
-                if (streams != null)
+                string botAppId = BotOptions.Current?.AadAppId;
+                if (this.Call?.Participants == null) return;
+
+                foreach (var participant in this.Call.Participants)
                 {
-                    var summary = string.Join(", ", streams.Select(s => $"{s.MediaType}:{s.Direction}:{s.SourceId}"));
-                    this.graphLogger.Info($"[Participant Updated] {GetDisplayName(sender)} streams -> {summary}");
-                }
-            }
-            catch { }
+                    if (participant.Resource.IsInLobby == true) continue;
+                    if (participant.Resource.Info?.Identity?.Application?.Id == botAppId) continue;
 
-            this.SubscribeParticipantMediaStreams();
-        }
+                    var streams = participant.Resource.MediaStreams;
+                    if (streams == null) continue;
 
-        private static string GetDisplayName(IParticipant participant)
-        {
-            var identity = participant?.Resource?.Info?.Identity;
-            var name = identity?.User?.DisplayName;
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                name = identity?.Application?.DisplayName;
-            }
-
-            if (string.IsNullOrWhiteSpace(name) && identity?.AdditionalData != null)
-            {
-                // Guests / phone users show up under additional identity keys (e.g. "guest", "phone").
-                foreach (var kvp in identity.AdditionalData)
-                {
-                    var token = kvp.Value as Newtonsoft.Json.Linq.JObject;
-                    var dn = token?["displayName"]?.ToString();
-                    if (!string.IsNullOrWhiteSpace(dn))
+                    foreach (var stream in streams)
                     {
-                        name = dn;
-                        break;
+                        if (uint.TryParse(stream.SourceId, out uint msi) && msi > 0)
+                        {
+                            string label = stream.Label ?? "";
+                            string mediaTypeStr = stream.MediaType.ToString();
+
+                            // CRITICAL FIX: Only subscribe to a participant MSI if the stream is actively sending!
+                            // If stream.Direction is Inactive or ReceiveOnly, subscribing to it will overwrite and break the active stream!
+                            bool isSending = stream.Direction == MediaDirection.SendOnly || stream.Direction == MediaDirection.SendReceive;
+                            if (!isSending)
+                            {
+                                continue;
+                            }
+
+                            // 1. Screen sharing stream (VBSS)
+                            if (mediaTypeStr.IndexOf("ScreenSharing", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                label.IndexOf("sharing", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                try
+                                {
+                                    this.vbssSocket?.Subscribe(VideoResolution.HD1080p, msi);
+                                    this.graphLogger.Info($"[VBSS Socket] Subscribed to active screen share MSI {msi} ({label}) for {participant.Id}");
+                                    Console.WriteLine($">>> [VBSS Socket] Subscribed to active screen share MSI {msi} ({label})");
+                                }
+                                catch (Exception ex)
+                                {
+                                    this.graphLogger.Warn($"[VBSS Socket] Error subscribing MSI {msi}: {ex.Message}");
+                                }
+                            }
+                            // 2. Participant camera / video stream
+                            else if (mediaTypeStr.IndexOf("Video", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                     label.IndexOf("video", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                try
+                                {
+                                    this.videoSocket?.Subscribe(VideoResolution.HD720p, msi);
+                                    this.graphLogger.Info($"[Video Socket] Subscribed to meeting video MSI {msi} ({label}) for {participant.Id}");
+                                    Console.WriteLine($">>> [Video Socket] Subscribed to meeting video MSI {msi} ({label})");
+                                }
+                                catch (Exception ex)
+                                {
+                                    this.graphLogger.Warn($"[Video Socket] Error subscribing MSI {msi}: {ex.Message}");
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            return string.IsNullOrWhiteSpace(name) ? $"Participant {participant?.Id?.Substring(0, Math.Min(8, participant.Id.Length))}" : name;
-        }
-
-        private static string FirstName(string displayName)
-        {
-            if (string.IsNullOrWhiteSpace(displayName))
+            catch (Exception ex)
             {
-                return "there";
+                this.graphLogger.Warn($"Error subscribing participant media streams: {ex.Message}");
             }
-
-            var parts = displayName.Trim().Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries);
-            return parts.Length > 0 ? parts[0] : displayName;
-        }
-
-        private (string ParticipantId, string DisplayName) ResolveParticipantByMsi(uint msi)
-        {
-            try
-            {
-                var participant = this.Call.Participants.FirstOrDefault(p =>
-                    p.Resource?.MediaStreams != null &&
-                    p.Resource.MediaStreams.Any(m => m.SourceId == msi.ToString()));
-
-                if (participant != null)
-                {
-                    return (participant.Id, GetDisplayName(participant));
-                }
-            }
-            catch { }
-
-            return (null, msi == 0 ? "Presenter" : $"Presenter_MSI{msi}");
         }
 
         // ===================================================================
-        // 7. Call state, removal detection & chat message posting
+        // 7. Detection of Bot Removal & Group Chat Message Posting
         // ===================================================================
         private void OnCallUpdated(ICall sender, ResourceEventArgs<Call> args)
         {
@@ -1378,13 +750,18 @@ namespace TeamsCallingBot.Bot
             // Post welcome message and subscribe streams when call becomes Established
             if (args.NewResource.State == CallState.Established)
             {
-                this.callEstablished = true;
                 if (Interlocked.Exchange(ref this.joinWelcomeSent, 1) == 0)
                 {
-                    this.Timeline.AddEvent("call_established", this.Call.Id);
                     _ = Task.Run(() => this.PostTextMessageToChatAsync(
-                        "🤖 <b>Teams AI Assistant</b> has joined the meeting.<br/>• Audio recording &amp; per-speaker capture: <b>Active</b><br/>• Screen share video recording: <b>Ready</b> (starts automatically when someone shares)<br/>• Bot video status tile: <b>Active</b>"));
+                        "🤖 <b>Teams AI Assistant</b> has joined the meeting.<br/>• Audio recording & unmixed speaker capture: <b>Active</b><br/>• Video status broadcast: <b>Active</b><br/>• Screen share photo capture: <b>Ready</b>"));
                 }
+
+                try
+                {
+                    this.vbssSocket?.Subscribe(VideoResolution.HD1080p);
+                    this.videoSocket?.Subscribe(VideoResolution.HD720p);
+                }
+                catch { }
 
                 this.SubscribeParticipantMediaStreams();
             }
@@ -1399,12 +776,12 @@ namespace TeamsCallingBot.Bot
                 return;
             }
 
-            // Check if removed by user / organizer (subcodes 7002, 702, 403, or keyword messages)
+            // Check if removed by user / organizer (subcodes 7002, 702, 5000, 403, or keyword messages)
             bool wasRemovedByUser = false;
             if (resultInfo != null)
             {
                 string msg = resultInfo.Message?.ToLowerInvariant() ?? "";
-                if (resultInfo.Subcode == 7002 || resultInfo.Subcode == 702 || resultInfo.Code == 403 ||
+                if (resultInfo.Subcode == 7002 || resultInfo.Subcode == 702 || resultInfo.Subcode == 5000 || resultInfo.Code == 403 ||
                     msg.Contains("removed") || msg.Contains("kicked") || msg.Contains("ejected") || msg.Contains("organizer"))
                 {
                     wasRemovedByUser = true;
@@ -1413,7 +790,7 @@ namespace TeamsCallingBot.Bot
 
             if (wasRemovedByUser)
             {
-                Console.WriteLine(">>> BOT REMOVAL DETECTED: Announcing and posting notification message...");
+                Console.WriteLine(">>> BOT REMOVAL DETECTED: Announcing verbally and posting notification to group chat...");
                 _ = Task.Run(async () =>
                 {
                     try
@@ -1430,6 +807,13 @@ namespace TeamsCallingBot.Bot
                     "⚠️ <b>Teams Calling Bot Notification:</b> The bot was removed from this meeting by a participant or organizer.",
                     isRemovalNotification: true));
             }
+            else
+            {
+                Console.WriteLine(">>> CALL TERMINATION / BOT LEAVING: Posting group chat departure notification...");
+                _ = Task.Run(() => this.PostTextMessageToChatAsync(
+                    "👋 <b>Teams Calling Bot Notification:</b> The bot has left the meeting. All session audio, screen captures, and transcripts have been archived.",
+                    isRemovalNotification: true));
+            }
 
             _ = this.HandleCallEndedAsync().ContinueWith(t =>
             {
@@ -1440,58 +824,256 @@ namespace TeamsCallingBot.Bot
             });
         }
 
+        public string GetEffectiveChatThreadId()
+        {
+            if (!string.IsNullOrWhiteSpace(this.chatThreadId))
+            {
+                return this.chatThreadId;
+            }
+
+            try
+            {
+                var threadId = this.Call.Resource?.ChatInfo?.ThreadId;
+                if (!string.IsNullOrWhiteSpace(threadId))
+                {
+                    return threadId;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        public string GetEffectiveAccessToken()
+        {
+            if (!string.IsNullOrWhiteSpace(this.botAccessToken))
+            {
+                return this.botAccessToken;
+            }
+
+            return BotOptions.Current?.OverrideBearerToken;
+        }
+
+        private static string cachedBfToken = null;
+        private static DateTime bfTokenExpiry = DateTime.MinValue;
+        private static readonly object bfTokenLock = new object();
+
+        /// <summary>
+        /// Acquires a Bot Framework OAuth token using app credentials (audience: https://api.botframework.com).
+        /// This bypasses Microsoft Graph's ChatMessage.Send permission requirements completely!
+        /// </summary>
+        public static async Task<string> GetBotFrameworkTokenAsync(IGraphLogger logger = null)
+        {
+            lock (bfTokenLock)
+            {
+                if (!string.IsNullOrWhiteSpace(cachedBfToken) && DateTime.UtcNow < bfTokenExpiry)
+                {
+                    return cachedBfToken;
+                }
+            }
+
+            BotOptions.Reload();
+            string appId = BotOptions.Current?.AadAppId;
+            string appSecret = BotOptions.Current?.AadAppSecretOrCertThumbprint;
+            string tenantId = BotOptions.Current?.AadTenantId;
+
+            if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(appSecret))
+            {
+                string missing = $"AppId={(string.IsNullOrWhiteSpace(appId) ? "MISSING" : "OK")}, Secret={(string.IsNullOrWhiteSpace(appSecret) ? "MISSING" : "OK")}";
+                Console.WriteLine($">>> [BF Token] CANNOT acquire token: {missing}");
+                logger?.Warn($"[BF Token] CANNOT acquire token: {missing}");
+                return null;
+            }
+
+            // Endpoints to attempt: specific tenant endpoint (do not use /common/ for single-tenant apps)
+            var tokenEndpoints = !string.IsNullOrWhiteSpace(tenantId) && !tenantId.Equals("common", StringComparison.OrdinalIgnoreCase)
+                ? new[] { $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token" }
+                : new[] { "https://login.microsoftonline.com/common/oauth2/v2.0/token" };
+
+            foreach (var tokenEndpoint in tokenEndpoints)
+            {
+                try
+                {
+                    Console.WriteLine($">>> [BF Token] Requesting token from {tokenEndpoint} for api.botframework.com...");
+                    logger?.Info($"[BF Token] Requesting token from {tokenEndpoint} for api.botframework.com...");
+
+                    using (var client = new HttpClient())
+                    {
+                        var pairs = new List<KeyValuePair<string, string>>
+                        {
+                            new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                            new KeyValuePair<string, string>("client_id", appId),
+                            new KeyValuePair<string, string>("client_secret", appSecret),
+                            new KeyValuePair<string, string>("scope", "https://api.botframework.com/.default")
+                        };
+
+                        var content = new FormUrlEncodedContent(pairs);
+                        var resp = await client.PostAsync(tokenEndpoint, content).ConfigureAwait(false);
+                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            var jobj = JObject.Parse(json);
+                            string token = jobj["access_token"]?.ToString();
+                            int expiresIn = jobj["expires_in"]?.Value<int>() ?? 3600;
+
+                            lock (bfTokenLock)
+                            {
+                                cachedBfToken = token;
+                                bfTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+                            }
+
+                            Console.WriteLine($">>> [BF Token] SUCCESS - token acquired from {tokenEndpoint}, expires in {expiresIn}s");
+                            logger?.Info($"[BF Token] SUCCESS - token acquired from {tokenEndpoint}, expires in {expiresIn}s");
+                            return token;
+                        }
+                        else
+                        {
+                            Console.WriteLine($">>> [BF Token] {tokenEndpoint} FAILED ({(int)resp.StatusCode}): {json}");
+                            logger?.Warn($"[BF Token] {tokenEndpoint} FAILED ({(int)resp.StatusCode}): {json}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($">>> [BF Token] EXCEPTION on {tokenEndpoint}: {ex.GetType().Name}: {ex.Message}");
+                    logger?.Error(ex, $"[BF Token] EXCEPTION on {tokenEndpoint}");
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Posts an activity to a Teams conversation via the official Bot Framework Connector API.
+        /// Standard for Teams bots, requires NO Microsoft Graph ChatMessage.Send.* permissions.
+        /// The activity MUST include from, conversation, channelId, and serviceUrl fields or Teams will reject it.
+        /// </summary>
+        public async Task<bool> PostActivityViaBotFrameworkAsync(string threadId, string text)
+        {
+            string bfToken = await GetBotFrameworkTokenAsync(this.graphLogger).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(bfToken))
+            {
+                this.graphLogger.Warn("[BotFramework Connector] Could not acquire Bot Framework token.");
+                return false;
+            }
+
+            string botAppId = BotOptions.Current?.AadAppId ?? string.Empty;
+            string tenantId = BotOptions.Current?.AadTenantId ?? string.Empty;
+
+            // Try multiple SMBA regional endpoints.
+            // IMPORTANT: Do NOT Uri.EscapeDataString the threadId - it must be passed verbatim
+            // (Teams thread IDs like "19:meeting_xxx@thread.v2" are already valid path segments).
+            var serviceUrls = new[]
+            {
+                "https://smba.trafficmanager.net/apis/",
+                "https://smba.trafficmanager.net/apac/",
+                "https://smba.trafficmanager.net/amer/",
+                "https://smba.trafficmanager.net/emea/"
+            };
+
+            // Full Bot Framework activity - 'from', 'conversation', 'channelId', 'serviceUrl' are required.
+            foreach (var serviceUrl in serviceUrls)
+            {
+                string url = $"{serviceUrl}v3/conversations/{threadId}/activities";
+                var activity = new
+                {
+                    type = "message",
+                    text = text,
+                    textFormat = "markdown",
+                    channelId = "msteams",
+                    serviceUrl = serviceUrl,
+                    from = new { id = botAppId, name = "TDA Bot" },
+                    conversation = new { id = threadId, isGroup = true, tenantId = tenantId },
+                    channelData = new { tenant = new { id = tenantId } }
+                };
+
+                string jsonPayload = JsonConvert.SerializeObject(activity);
+
+                try
+                {
+                    using (var client = new HttpClient())
+                    {
+                        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bfToken);
+                        var reqContent = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                        var resp = await client.PostAsync(url, reqContent).ConfigureAwait(false);
+
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            this.graphLogger.Info($"[BotFramework Connector] Successfully posted message to {serviceUrl}");
+                            Console.WriteLine($">>> [BotFramework Connector] Message sent successfully via {serviceUrl}");
+                            return true;
+                        }
+                        else
+                        {
+                            string errBody = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                            this.graphLogger.Warn($"[BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
+                            Console.WriteLine($">>> [BotFramework Connector] {serviceUrl} returned {(int)resp.StatusCode}: {errBody}");
+
+                            if (errBody != null && errBody.IndexOf("BotNotInConversationRoster", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                this.graphLogger.Warn("[BotFramework Connector] BotNotInConversationRoster: The bot app is not yet added to this meeting's roster. To enable meeting chat posting, a participant should click '+' (Apps) in Teams meeting and add the bot app.");
+                                Console.WriteLine(">>> [BotFramework Connector] HINT: Add the bot app to this meeting via '+' (Apps) in Teams to allow it in the meeting chat roster.");
+                                return false;
+                            }
+
+                            // If 401 on first attempt, the token is invalid — bail immediately.
+                            if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized) return false;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Warn($"[BotFramework Connector] Exception on {serviceUrl}: {ex.Message}");
+                }
+            }
+
+            return false;
+        }
+
         /// <summary>
         /// Posts a formatted text/HTML message into the Teams meeting group chat.
-        /// Order: Bot Framework Connector (no Graph permission needed) -> Graph chat API fallback.
+        /// Tries Bot Framework Connector API first (no Graph permission needed), then falls back to Graph.
         /// </summary>
         public async Task<bool> PostTextMessageToChatAsync(string htmlContent, bool isRemovalNotification = false)
         {
-            if (string.IsNullOrWhiteSpace(this.chatThreadId))
+            string threadId = this.GetEffectiveChatThreadId();
+            if (string.IsNullOrWhiteSpace(threadId))
             {
                 this.graphLogger.Warn("[Chat Notification] Missing chatThreadId - cannot post message.");
                 return false;
             }
 
-            if (this.options.UseBotFrameworkForChat && this.chatClient.IsConfigured)
+            // 1. PRIMARY: Bot Framework Connector API (official bot messaging, no Graph admin consent needed)
+            string markdownText = htmlContent
+                .Replace("<b>", "**").Replace("</b>", "**")
+                .Replace("<i>", "*").Replace("</i>", "*");
+
+            bool bfSuccess = await this.PostActivityViaBotFrameworkAsync(threadId, markdownText).ConfigureAwait(false);
+            if (bfSuccess)
             {
-                bool viaConnector = await this.chatClient.SendMessageAsync(this.chatThreadId, htmlContent).ConfigureAwait(false);
-                if (viaConnector)
+                if (isRemovalNotification)
                 {
-                    this.Timeline.AddEvent("chat_posted", "connector");
-                    if (isRemovalNotification)
-                    {
-                        this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, htmlContent, true);
-                    }
-
-                    return true;
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, true);
                 }
-
-                this.graphLogger.Warn("[Chat Notification] Connector post failed - falling back to Graph chat API.");
-            }
-            else if (this.options.UseBotFrameworkForChat)
-            {
-                this.graphLogger.Warn("[Chat Notification] Bot Framework chat enabled but AadAppSecretOrCertThumbprint is a placeholder - falling back to Graph chat API.");
+                return true;
             }
 
-            string token = this.botAccessToken;
-            if (string.IsNullOrWhiteSpace(token))
-            {
-                token = BotOptions.Current?.OverrideBearerToken;
-            }
-
+            // 2. FALLBACK: Microsoft Graph Chat API
+            string token = this.GetEffectiveAccessToken();
             if (string.IsNullOrWhiteSpace(token))
             {
                 this.graphLogger.Warn("[Chat Notification] No access token available to post chat message.");
                 if (isRemovalNotification)
                 {
-                    this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, htmlContent, false);
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, false);
                 }
                 return false;
             }
 
             try
             {
-                string endpoint = $"https://graph.microsoft.com/v1.0/chats/{this.chatThreadId}/messages";
+                string endpoint = $"https://graph.microsoft.com/v1.0/chats/{threadId}/messages";
 
                 using (var client = new HttpClient())
                 {
@@ -1514,14 +1096,13 @@ namespace TeamsCallingBot.Bot
 
                     if (isRemovalNotification)
                     {
-                        this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, htmlContent, success);
+                        this.RecordingsManager.SaveRemovalMessageRecord(threadId, htmlContent, success);
                     }
 
                     if (success)
                     {
-                        this.graphLogger.Info($"[Chat Notification] Successfully posted message to meeting chat {this.chatThreadId}!");
+                        this.graphLogger.Info($"[Chat Notification] Successfully posted message to meeting chat {threadId}!");
                         Console.WriteLine($">>> [Chat Notification] Successfully posted message to meeting chat!");
-                        this.Timeline.AddEvent("chat_posted", "graph");
                         return true;
                     }
                     else
@@ -1529,6 +1110,10 @@ namespace TeamsCallingBot.Bot
                         var err = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         this.graphLogger.Warn($"[Chat Notification] Graph chat post returned ({response.StatusCode}): {err}");
                         Console.WriteLine($">>> [Chat Notification] Graph chat post returned ({response.StatusCode}): {err}");
+                        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                        {
+                            Console.WriteLine($">>> [ACTION NEEDED] Azure AD missing Application permission 'ChatMessage.Send.Chat' or 'Chat.ReadWrite.All'. Please grant Admin Consent in Azure Portal.");
+                        }
                         return false;
                     }
                 }
@@ -1538,28 +1123,133 @@ namespace TeamsCallingBot.Bot
                 this.graphLogger.Error(ex, "Error posting message to meeting chat.");
                 if (isRemovalNotification)
                 {
-                    this.RecordingsManager.SaveRemovalMessageRecord(this.chatThreadId, $"Exception: {ex.Message}", false);
+                    this.RecordingsManager.SaveRemovalMessageRecord(threadId, $"Exception: {ex.Message}", false);
                 }
                 return false;
             }
         }
 
+        /// <summary>
+        /// Initializes the CTS for chat monitoring. Actual incoming chat messages are received
+        /// via the Bot Framework /api/messages endpoint (BotMessagingController) and routed to
+        /// HandleIncomingChatActivity() below. This avoids needing Chat.Read.All Graph permissions.
+        /// </summary>
+        private void StartMeetingChatMonitor()
+        {
+            this.chatMonitorCts = new CancellationTokenSource();
+            string threadId = this.GetEffectiveChatThreadId();
+            Console.WriteLine($">>> [Chat Monitor] Initialized. Meeting chat thread: {threadId ?? "(not yet known - will be set from call.Resource.ChatInfo)"}. Listening via /api/messages.");
+        }
+
+        /// <summary>
+        /// Called by BotMessagingController when Teams delivers an incoming chat message activity
+        /// to /api/messages. Replies both in chat and via voice.
+        /// </summary>
+        public void HandleIncomingChatActivity(string fromUserName, string fromUserId, string messageText, string incomingServiceUrl)
+        {
+            if (string.IsNullOrWhiteSpace(messageText)) return;
+
+            string lower = messageText.ToLowerInvariant();
+
+            // Only respond to messages that mention/address the bot
+            bool isBotMention = lower.Contains("tda") || lower.Contains("bot") ||
+                                 lower.Contains("kaise ho") || lower.Contains("kaisa") ||
+                                 lower.Contains("hi") || lower.Contains("hello") ||
+                                 lower.Contains("hey") || lower.Contains("help") ||
+                                 lower.Contains("status") || lower.Contains("recording");
+
+            if (!isBotMention) return;
+
+            this.graphLogger.Info($"[Chat Monitor] Incoming message from {fromUserName}: \"{messageText}\"");
+            Console.WriteLine($">>> [Chat Monitor] Incoming message from {fromUserName}: \"{messageText}\"");
+
+            string chatReply;
+            string voiceReply;
+
+            if (lower.Contains("kaise ho") || lower.Contains("kaisa"))
+            {
+                chatReply = $"Hello {fromUserName}! 🙏 Main badhiya hoon (I'm doing well!). Main TDA Bot hoon, aapka meeting assistant. Kya madad kar sakta hoon?";
+                voiceReply = $"Hello {fromUserName}! Main badhiya hoon. I am TDA Bot. How can I help you today?";
+            }
+            else if (lower.Contains("status") || lower.Contains("recording"))
+            {
+                chatReply = $"📊 **TDA Bot Status:** \n• 🎙️ Audio recording: Active\n• 📺 Screen share capture: Active\n• 🤖 AI assistant: Listening\n\nMeeting session is being recorded and transcribed.";
+                voiceReply = "TDA Bot is active. I am recording meeting audio and capturing screen shares.";
+            }
+            else if (lower.Contains("help"))
+            {
+                chatReply = $"Hi {fromUserName}! 👋 I'm **TDA Bot**. I can:\n• 🎙️ Record meeting audio\n• 📺 Capture screen shares\n• 💬 Reply to your messages\n\nJust type **tda bot** or **hi bot** to talk to me!";
+                voiceReply = $"Hello {fromUserName}! I am TDA Bot. I am recording the meeting and can assist you.";
+            }
+            else
+            {
+                chatReply = $"Hello {fromUserName}! 👋 I'm **TDA Bot**, your AI meeting assistant. I'm actively listening and recording this meeting. Type **tda bot status** to check my status.";
+                voiceReply = $"Hello {fromUserName}! I am TDA Bot, your meeting assistant. How can I assist you?";
+            }
+
+            // If we got a serviceUrl from the incoming message, use it for the reply (most reliable)
+            string effectiveThreadId = this.GetEffectiveChatThreadId();
+            if (!string.IsNullOrWhiteSpace(effectiveThreadId))
+            {
+                _ = Task.Run(async () =>
+                {
+                    bool sent = await this.PostActivityViaBotFrameworkAsync(effectiveThreadId, chatReply).ConfigureAwait(false);
+                    if (!sent)
+                    {
+                        // Fallback to Graph if BF fails
+                        await this.PostTextMessageToChatAsync(chatReply).ConfigureAwait(false);
+                    }
+                });
+            }
+
+            // Speak response aloud into meeting
+            if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
+            {
+                _ = this.AudioSender.SpeakAsync(voiceReply);
+            }
+        }
+
+        /// <summary>
+        /// Handles real-time speech recognition triggers spoken aloud into the meeting microphone
+        /// (such as "tda bot", "kaise ho", "hi bot", "status", "help"). Replies immediately via voice and chat.
+        /// </summary>
+        private void OnVoiceTriggerDetected(string triggerText, string voiceReply, string chatReply)
+        {
+            this.graphLogger?.Info($"[Voice Trigger] Heard: \"{triggerText}\" -> Speaking aloud: \"{voiceReply}\"");
+            Console.WriteLine($">>> [Voice Trigger] Heard: \"{triggerText}\" -> Speaking aloud: \"{voiceReply}\"");
+
+            // 1. Speak aloud into the meeting audio stream immediately
+            if (this.AudioSender != null)
+            {
+                _ = this.AudioSender.SpeakAsync(voiceReply);
+            }
+
+            // 2. Also attempt to post the reply to the meeting chat
+            string effectiveThreadId = this.GetEffectiveChatThreadId();
+            if (!string.IsNullOrWhiteSpace(effectiveThreadId) && !string.IsNullOrWhiteSpace(chatReply))
+            {
+                _ = Task.Run(async () =>
+                {
+                    bool sent = await this.PostActivityViaBotFrameworkAsync(effectiveThreadId, chatReply).ConfigureAwait(false);
+                    if (!sent)
+                    {
+                        await this.PostTextMessageToChatAsync(chatReply).ConfigureAwait(false);
+                    }
+                });
+            }
+        }
+
         // ===================================================================
-        // 4. Wind-down: video finalisation, audio flush, transcripts, metadata
+        // 4. Transcript & Audio Disk Saving (Wind-Down)
         // ===================================================================
         private async Task HandleCallEndedAsync()
         {
-            this.graphLogger.Info($"Call {this.Call.Id} terminated - saving all audio, video, transcripts and metadata.");
+            this.graphLogger.Info($"Call {this.Call.Id} terminated - saving all audio, transcripts and metadata.");
 
-            // 0. Finalise video files first (fast; makes the AVIs playable even if a later step fails)
-            this.StopVbssRecorder("call ended");
-            this.StopCameraRecorder("call ended");
-            this.Timeline.EndedAt = DateTime.Now;
-
-            // 1. Flush Audio to the session folder (unchanged)
+            // 1. Flush Audio to D:\Teamsbot\Recordings\<SessionId>\ (Same folder)
             var speakerAudios = this.AudioAggregator.FlushToWavFiles(this.RecordingsManager.SessionDirectory);
 
-            // 2. Transcribe (unchanged)
+            // 2. Transcribe
             var entries = new List<TranscriptEntry>();
             if (speakerAudios.Count > 0)
             {
@@ -1581,86 +1271,10 @@ namespace TeamsCallingBot.Bot
                 }
             }
 
-            // 3. Save Transcripts (.txt and .json) (unchanged)
+            // 3. Save Transcripts (.txt and .json)
             this.RecordingsManager.SaveTranscripts(entries);
 
-            // 4. Optional MP4 conversion of the recorded video segments (only when ffmpeg is configured)
-            var allVideoSessions = this.Timeline.ScreenShareSessions.Concat(this.Timeline.CameraSessions).ToList();
-            if (!string.IsNullOrWhiteSpace(this.options.FfmpegPath))
-            {
-                foreach (var session in allVideoSessions)
-                {
-                    try
-                    {
-                        session.Mp4Files = await VideoRecorder.ConvertSegmentsToMp4Async(session.VideoFiles, this.options.FfmpegPath, this.RecordingsManager.Log).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        this.graphLogger.Warn($"[Video] MP4 conversion failed: {ex.Message}");
-                    }
-                }
-            }
-
-            // 5. Save timeline (who joined/left, who shared what and when, file names)
-            string timelinePath = null;
-            try
-            {
-                timelinePath = this.Timeline.Save(this.RecordingsManager.SessionDirectory);
-            }
-            catch (Exception ex)
-            {
-                this.graphLogger.Warn($"[Timeline] Save failed: {ex.Message}");
-            }
-
-            // 6. Generate Minutes of Meeting (MoM) - detailed Word doc from transcript + screen snapshots
-            if (this.options.Mom?.Enabled == true)
-            {
-                try
-                {
-                    // 16 kHz, 16-bit mono WAV = 32,000 bytes/second of PCM after the 44-byte header
-                    var talkTimeByName = speakerAudios.ToDictionary(
-                        s => this.ResolveSpeakerName(s.SpeakerId),
-                        s => System.IO.File.Exists(s.WavPath) ? Math.Max(0, new FileInfo(s.WavPath).Length - 44) / 32000.0 : 0.0,
-                        StringComparer.OrdinalIgnoreCase);
-
-                    var momResult = await TeamsCallingBot.Mom.MomGenerator.GenerateAsync(
-                        this.RecordingsManager.SessionDirectory,
-                        this.Timeline,
-                        entries,
-                        talkTimeByName,
-                        this.options.Mom,
-                        msg => this.RecordingsManager.Log(msg)).ConfigureAwait(false);
-
-                    this.graphLogger.Info($"[MoM] Generated {momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath} (AI: {momResult.UsedAi})");
-                    Console.WriteLine($">>> [MoM] Generated {(momResult.UsedAi ? "AI-enhanced" : "local")} Minutes of Meeting -> {Path.GetFileName(momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath)}");
-
-                    // 6a. Upload the MoM doc (and, if configured, the transcript files) to GCS and get
-                    // signed links, then hand off ONE combined notification (summary + link) to the
-                    // Cloud Run relay - the VM never talks to Power Automate/email directly (see
-                    // PRODUCTION_STATUS.md §4). Both steps are best-effort - failures here never
-                    // affect the local files already saved above.
-                    if (!string.IsNullOrWhiteSpace(momResult.DocxPath))
-                    {
-                        var gcsUploader = new GcsUploader(this.options.Gcs, msg => this.RecordingsManager.Log(msg));
-                        string signedUrl = await gcsUploader.UploadMomDocumentAsync(momResult.DocxPath, this.Call.Id, this.chatThreadId).ConfigureAwait(false);
-                        await gcsUploader.UploadTranscriptFilesAsync(this.RecordingsManager.SessionDirectory, this.Call.Id, this.chatThreadId).ConfigureAwait(false);
-
-                        var relayClient = new CloudRunRelayClient(this.options.CloudRunRelay, msg => this.RecordingsManager.Log(msg));
-                        await relayClient.SendMomNotificationAsync(
-                            momResult.Document,
-                            this.chatThreadId,
-                            signedUrl,
-                            this.options.Gcs?.SignedUrlExpiryHours ?? 168,
-                            momResult.UsedAi).ConfigureAwait(false);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    this.graphLogger.Error(ex, "[MoM] Generation failed.");
-                }
-            }
-
-            // 7. Save Session Metadata
+            // 4. Save Session Metadata
             var metadata = new
             {
                 SessionId = this.Call.Id,
@@ -1669,10 +1283,6 @@ namespace TeamsCallingBot.Bot
                 DurationSeconds = (DateTime.Now - this.sessionStartTime).TotalSeconds,
                 SpeakerAudioFilesCount = speakerAudios.Count,
                 TranscriptsCount = entries.Count,
-                ScreenShareSessions = this.Timeline.ScreenShareSessions.Select(s => new { s.PresenterName, s.StartedAt, s.EndedAt, s.FramesWritten, s.VideoFiles, s.Mp4Files, SnapshotCount = s.SnapshotFiles.Count }),
-                CameraSessions = this.Timeline.CameraSessions.Select(s => new { s.PresenterName, s.StartedAt, s.EndedAt, s.FramesWritten, s.VideoFiles, s.Mp4Files }),
-                Participants = this.Timeline.Participants.Select(p => new { p.DisplayName, p.IsBot, p.JoinedAt, p.LeftAt }),
-                TimelineFile = timelinePath,
                 SessionDirectory = this.RecordingsManager.SessionDirectory
             };
             this.RecordingsManager.SaveMetadata(metadata);
@@ -1688,19 +1298,11 @@ namespace TeamsCallingBot.Bot
                 return "Unknown speaker";
             }
 
-            var participant = this.Call.Participants.FirstOrDefault(p =>
+            var participant = this.Call.Participants.SingleOrDefault(p =>
                 p.Resource.IsInLobby == false &&
-                p.Resource.MediaStreams != null &&
                 p.Resource.MediaStreams.Any(m => m.SourceId == speakerId.ToString()));
 
             var displayName = participant?.Resource?.Info?.Identity?.User?.DisplayName;
-            if (string.IsNullOrWhiteSpace(displayName))
-            {
-                // The participant may already have left - fall back to the timeline's record of who owned that MSI.
-                displayName = this.Timeline.ScreenShareSessions.Concat(this.Timeline.CameraSessions)
-                    .FirstOrDefault(s => s.MediaSourceId == speakerId)?.PresenterName;
-            }
-
             return string.IsNullOrWhiteSpace(displayName) ? $"Speaker {speakerId}" : displayName;
         }
 
@@ -1716,23 +1318,12 @@ namespace TeamsCallingBot.Bot
             this.videoBroadcastCts?.Cancel();
             this.periodicFlushCts?.Cancel();
             this.autoLeaveCts?.Cancel();
+            this.chatMonitorCts?.Cancel();
+            this.voiceRecognizer?.Dispose();
             this.AudioSender?.Dispose();
 
             this.Call.OnUpdated -= this.OnCallUpdated;
             this.Call.Participants.OnUpdated -= this.OnParticipantsUpdated;
-
-            lock (this.participantsWithUpdateHook)
-            {
-                foreach (var participant in this.Call.Participants)
-                {
-                    if (this.participantsWithUpdateHook.Contains(participant.Id))
-                    {
-                        try { participant.OnUpdated -= this.OnParticipantUpdated; } catch { }
-                    }
-                }
-
-                this.participantsWithUpdateHook.Clear();
-            }
 
             if (this.audioSocket != null)
             {
@@ -1743,29 +1334,15 @@ namespace TeamsCallingBot.Bot
             {
                 this.vbssSocket.VideoReceiveStatusChanged -= this.OnVbssReceiveStatusChanged;
                 this.vbssSocket.VideoMediaReceived -= this.OnVbssMediaReceived;
-                this.vbssSocket.MediaStreamFailure -= this.OnMediaStreamFailure;
             }
 
             if (this.videoSocket != null)
             {
                 this.videoSocket.VideoSendStatusChanged -= this.OnVideoSendStatusChanged;
                 this.videoSocket.VideoKeyFrameNeeded -= this.OnVideoKeyFrameNeeded;
-                this.videoSocket.VideoReceiveStatusChanged -= this.OnVideoReceiveStatusChanged;
-                this.videoSocket.VideoMediaReceived -= this.OnVideoMediaReceived;
-                this.videoSocket.MediaStreamFailure -= this.OnMediaStreamFailure;
             }
 
-            // Safety net: if the call was disposed without a Terminated notification, still close the AVIs.
-            this.StopVbssRecorder("handler disposed");
-            this.StopCameraRecorder("handler disposed");
-
-            this.chatClient?.Dispose();
             this.latestScreenBitmap?.Dispose();
-            lock (this.visualizationLock)
-            {
-                this.currentVisualization?.Dispose();
-                this.currentVisualization = null;
-            }
         }
     }
 }

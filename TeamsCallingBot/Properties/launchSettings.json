@@ -2,11 +2,11 @@
   "profiles": {
     "TeamsCallingBot": {
       "commandName": "Project",
-      "launchBrowser": true,
+      "launchBrowser": false,
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
-      "applicationUrl": "https://localhost:50909;http://localhost:50910"
+      "applicationUrl": "https://localhost:443"
     }
   }
 }
