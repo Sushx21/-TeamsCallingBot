@@ -163,6 +163,31 @@ namespace TeamsCallingBot.Config
 
         public MomOptions Mom { get; set; } = new MomOptions();
 
+        // -------------------------------------------------------------------------------------
+        // Google Cloud Storage - uploads the finished MoM Word doc so it can be shared via a
+        // signed URL (see PowerAutomateOptions). Nothing else (audio/video/snapshots) is uploaded.
+        // -------------------------------------------------------------------------------------
+
+        public GcsOptions Gcs { get; set; } = new GcsOptions();
+
+        // -------------------------------------------------------------------------------------
+        // Cloud Run relay - one HTTP call per finished meeting: short summary + signed GCS link
+        // to the MoM Word document. Fired after Gcs upload succeeds. The VM never talks to Power
+        // Automate (or email) directly - it hands the payload to Cloud Run, which is the only
+        // component with a network path to Power Automate/email, and Cloud Run relays it onward.
+        // -------------------------------------------------------------------------------------
+
+        public CloudRunRelayOptions CloudRunRelay { get; set; } = new CloudRunRelayOptions();
+
+        // -------------------------------------------------------------------------------------
+        // TDA (Tata Steel Digital Assistant) integration - see Tda/TdaTokenProvider.cs and
+        // Tda/TdaClient.cs. All values here are placeholders until the TDA/"TSL AI" app
+        // registration details (base URL, token scope) are provided - see
+        // BOT_CAPABILITY_EXPECTATIONS.md section 7.
+        // -------------------------------------------------------------------------------------
+
+        public TdaOptions Tda { get; set; } = new TdaOptions();
+
         /// <summary>
         /// Set once at startup (Startup.cs) so static classes without DI access (TranscriptSaver)
         /// can still read config. Deliberately simple - this process only ever loads one BotOptions.
@@ -183,6 +208,21 @@ namespace TeamsCallingBot.Config
                 options.Mom = new MomOptions();
             }
 
+            if (options.Gcs == null)
+            {
+                options.Gcs = new GcsOptions();
+            }
+
+            if (options.CloudRunRelay == null)
+            {
+                options.CloudRunRelay = new CloudRunRelayOptions();
+            }
+
+            if (options.Tda == null)
+            {
+                options.Tda = new TdaOptions();
+            }
+
             Current = options;
             return options;
         }
@@ -196,6 +236,9 @@ namespace TeamsCallingBot.Config
     /// </summary>
     public class MomOptions
     {
+        /// <summary>Generate Minutes of Meeting at call end at all. Master on/off switch for this feature.</summary>
+        public bool Enabled { get; set; } = true;
+
         /// <summary>Write 08_minutes_of_meeting.docx (+ .md and .json) at call end.</summary>
         public bool GenerateWordDocument { get; set; } = true;
 
@@ -225,5 +268,121 @@ namespace TeamsCallingBot.Config
 
         /// <summary>HTTP timeout (seconds) for the summarisation request.</summary>
         public int RequestTimeoutSeconds { get; set; } = 600;
+    }
+
+    /// <summary>
+    /// Settings for uploading the finished 08_minutes_of_meeting.docx to Google Cloud Storage so a
+    /// signed, time-limited download link can be handed to Power Automate. Only the Word document
+    /// is uploaded - audio/video/snapshots stay local. See Storage/GcsUploader.cs.
+    /// </summary>
+    public class GcsOptions
+    {
+        /// <summary>Upload the MoM Word document to GCS at call end.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>Target bucket name (no gs:// prefix, no path).</summary>
+        public string BucketName { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Full path (on the VM) to the downloaded service-account JSON key file. The service
+        /// account needs the "Storage Object Admin" (or equivalent create+sign) role on BucketName.
+        /// </summary>
+        public string ServiceAccountKeyPath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Object path prefix inside the bucket. {ChatThreadId} and {CallId} tokens are substituted;
+        /// falls back to CallId alone if there is no chat thread. Example result:
+        /// "meetings/19-meeting_xxx@thread.v2/08_minutes_of_meeting.docx".
+        /// </summary>
+        public string ObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/08_minutes_of_meeting.docx";
+
+        /// <summary>Object path template for the human-readable transcript (04_transcript.txt).</summary>
+        public string TranscriptTextObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/04_transcript.txt";
+
+        /// <summary>Object path template for the structured transcript (04_transcript.json).</summary>
+        public string TranscriptJsonObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/04_transcript.json";
+
+        /// <summary>How long the signed download URL stays valid for.</summary>
+        public int SignedUrlExpiryHours { get; set; } = 168; // 7 days
+    }
+
+    /// <summary>
+    /// Settings for the single HTTP call the VM makes to a Cloud Run relay endpoint once the MoM is
+    /// generated (and uploaded to GCS, if enabled). The VM has no network path to Power Automate or
+    /// email - Cloud Run is the only component with that reach, so the VM's only job here is handing
+    /// off one short JSON payload (summary + signed GCS link to the one Word document) and letting
+    /// Cloud Run relay it to Power Automate / send the email. See Chat/CloudRunRelayClient.cs.
+    /// </summary>
+    public class CloudRunRelayOptions
+    {
+        /// <summary>Post the MoM notification to the Cloud Run relay endpoint at call end.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>The Cloud Run endpoint URL that receives the payload and relays it onward.</summary>
+        public string RelayUrl { get; set; } = string.Empty;
+
+        /// <summary>HTTP timeout (seconds) for the relay call.</summary>
+        public int RequestTimeoutSeconds { get; set; } = 30;
+    }
+
+    /// <summary>
+    /// Settings for talking to TDA (Tata Steel Digital Assistant): asking it a question so the bot
+    /// can speak the answer into the meeting, and sending it messages via a client-credentials token
+    /// scoped to the "TSL AI" resource. See Tda/TdaTokenProvider.cs and Tda/TdaClient.cs.
+    ///
+    /// DEFAULT-OFF BY DESIGN: every value below is a placeholder - the real base URL, scope and
+    /// endpoint paths are not yet known (see BOT_CAPABILITY_EXPECTATIONS.md section 7). Enabled
+    /// defaults to false so this integration stays completely inert - no token requests, no HTTP
+    /// calls, no behaviour change - on any deployment until someone deliberately turns it on with
+    /// real values. Every call site in CallHandler wraps TDA calls in try/catch so a misconfigured
+    /// or unreachable TDA never affects audio/video recording or the existing chat/MoM pipeline.
+    /// </summary>
+    public class TdaOptions
+    {
+        /// <summary>Master on/off switch. Must be explicitly set true - stays off by default.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>TDA API base URL, e.g. https://tda.tatasteel.example.com/api. Placeholder - not yet known.</summary>
+        public string BaseUrl { get; set; } = string.Empty;
+
+        /// <summary>
+        /// OAuth token endpoint used to acquire the "TSL AI" scoped token (client-credentials grant),
+        /// e.g. https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token. Placeholder.
+        /// </summary>
+        public string TokenEndpoint { get; set; } = string.Empty;
+
+        /// <summary>
+        /// App (client) id used to request the TSL AI token. Leave blank to reuse Bot:AadAppId if the
+        /// same app registration is authorized for the TDA/TSL AI scope.
+        /// </summary>
+        public string ClientId { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Client secret for the above. Leave blank to reuse Bot:AadAppSecretOrCertThumbprint.
+        /// Never commit a real value here - appsettings.json is .gitignored, same as the other secrets.
+        /// </summary>
+        public string ClientSecret { get; set; } = string.Empty;
+
+        /// <summary>
+        /// The exact "TSL AI" scope string to request, e.g. "api://{tsl-ai-app-id}/.default" or a
+        /// named scope like "api://{tsl-ai-app-id}/Message.Send". Must come from whoever owns the
+        /// TDA/TSL AI app registration - not guessable. Placeholder.
+        /// </summary>
+        public string Scope { get; set; } = string.Empty;
+
+        /// <summary>Endpoint TDA exposes for "ask a question, get a text answer". Placeholder.</summary>
+        public string QueryEndpointPath { get; set; } = "/query";
+
+        /// <summary>Endpoint TDA exposes for "send it a message". Placeholder.</summary>
+        public string MessageEndpointPath { get; set; } = "/message";
+
+        /// <summary>HTTP timeout (seconds) for TDA calls.</summary>
+        public int RequestTimeoutSeconds { get; set; } = 30;
+
+        /// <summary>
+        /// TDA answers are spoken via TTS - cap length so the bot doesn't read out a huge block of
+        /// text into the meeting. Longer answers are truncated with "...".
+        /// </summary>
+        public int MaxSpokenAnswerChars { get; set; } = 600;
     }
 }

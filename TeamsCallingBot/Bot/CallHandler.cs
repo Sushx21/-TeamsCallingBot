@@ -24,6 +24,7 @@ namespace TeamsCallingBot.Bot
     using TeamsCallingBot.Common;
     using TeamsCallingBot.Config;
     using TeamsCallingBot.Storage;
+    using TeamsCallingBot.Tda;
     using TeamsCallingBot.Video;
 
     /// <summary>
@@ -106,6 +107,22 @@ namespace TeamsCallingBot.Bot
         private readonly string botAccessToken;
         private readonly BotFrameworkChatClient chatClient;
 
+        // TDA (Tata Steel Digital Assistant) integration - inert unless Bot:Tda:Enabled is true
+        // and all placeholder config values have been filled in. See Tda/TdaClient.cs.
+        private readonly TdaClient tdaClient;
+
+        // Active-speaker tracking (drives camera-follow, see SubscribeParticipantMediaStreams) -
+        // updated from OnAudioMediaReceived, which already gives us the speaking participant's MSI.
+        private volatile uint lastActiveSpeakerMsi;
+
+        // Bot video "visualization" mode (chart / TDA answer / image shown on the bot's own video
+        // tile instead of the status card) - see Video/VideoFrameConverter.CreateVisualizationFrame
+        // and BOT_CAPABILITY_EXPECTATIONS.md section 4. Off by default (currentVisualization null).
+        private readonly object visualizationLock = new object();
+        private Bitmap currentVisualization;
+        private string currentVisualizationTitle;
+        private DateTime visualizationExpiresAt = DateTime.MinValue;
+
         public ICall Call { get; }
 
         public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null)
@@ -123,6 +140,9 @@ namespace TeamsCallingBot.Bot
             this.AudioAggregator = new AudioAggregator();
             this.Timeline = new MeetingTimeline { CallId = this.Call.Id, ChatThreadId = chatThreadId, StartedAt = this.sessionStartTime };
             this.chatClient = new BotFrameworkChatClient(this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.options.BotFrameworkServiceUrl, this.graphLogger);
+
+            var tdaTokenProvider = new TdaTokenProvider(this.options.Tda, this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.graphLogger);
+            this.tdaClient = new TdaClient(this.options.Tda, tdaTokenProvider, this.graphLogger);
 
             // 2. Wire Call Events
             this.Call.OnUpdated += this.OnCallUpdated;
@@ -241,6 +261,22 @@ namespace TeamsCallingBot.Bot
                             speakerBuffer.Data,
                             speakerBuffer.Length,
                             speakerBuffer.OriginalSenderTimestamp);
+
+                        // Camera-follow-active-speaker (see SubscribeParticipantMediaStreams): the audio
+                        // MSI belongs to the same participant resource as their camera MSI, so tracking
+                        // "who is speaking right now" here is enough to prefer their camera stream below -
+                        // no separate dominant-speaker notification needed.
+                        if (speakerBuffer.ActiveSpeakerId != 0 && speakerBuffer.ActiveSpeakerId != AudioAggregator.UnknownSpeakerId
+                            && speakerBuffer.ActiveSpeakerId != this.lastActiveSpeakerMsi)
+                        {
+                            this.lastActiveSpeakerMsi = speakerBuffer.ActiveSpeakerId;
+                            if (this.options.RecordParticipantVideo)
+                            {
+                                // Off the audio media thread - SubscribeParticipantMediaStreams does Graph
+                                // resource lookups + socket (un)subscribe calls, must never block audio delivery.
+                                _ = Task.Run(() => this.SubscribeParticipantMediaStreams());
+                            }
+                        }
                     }
                 }
                 else
@@ -483,6 +519,14 @@ namespace TeamsCallingBot.Bot
                 uint cameraMsi = 0;
                 IParticipant cameraOwner = null;
 
+                // Camera-follow-active-speaker: only one camera socket exists (SDK limitation - see
+                // BOT_CAPABILITY_EXPECTATIONS.md section 2/7), so when several participants are sending
+                // camera video, prefer whoever most recently spoke rather than an arbitrary "first found"
+                // participant. Falls back to first-found if no active speaker's camera is available.
+                string activeSpeakerParticipantId = this.ResolveParticipantByMsi(this.lastActiveSpeakerMsi).ParticipantId;
+                uint preferredCameraMsi = 0;
+                IParticipant preferredCameraOwner = null;
+
                 foreach (var participant in this.Call.Participants)
                 {
                     var resource = participant.Resource;
@@ -520,12 +564,27 @@ namespace TeamsCallingBot.Bot
                             sharer = participant;
                             sharerMsi = msi;
                         }
-                        else if (stream.MediaType == Modality.Video && cameraOwner == null)
+                        else if (stream.MediaType == Modality.Video)
                         {
-                            cameraOwner = participant;
-                            cameraMsi = msi;
+                            if (cameraOwner == null)
+                            {
+                                cameraOwner = participant;
+                                cameraMsi = msi;
+                            }
+
+                            if (preferredCameraOwner == null && activeSpeakerParticipantId != null && participant.Id == activeSpeakerParticipantId)
+                            {
+                                preferredCameraOwner = participant;
+                                preferredCameraMsi = msi;
+                            }
                         }
                     }
+                }
+
+                if (preferredCameraOwner != null)
+                {
+                    cameraOwner = preferredCameraOwner;
+                    cameraMsi = preferredCameraMsi;
                 }
 
                 // ---- Screen share -------------------------------------------------------------
@@ -877,7 +936,7 @@ namespace TeamsCallingBot.Bot
                         if (!snapshotSaved)
                         {
                             snapshotSaved = true;
-                            using (var card = VideoFrameConverter.CreateBotStatusCard("Teams AI Assistant", this.IsMuted ? "Muted" : "Recording audio and video", this.Call.Id, this.IsMuted, tick, this.activityLine))
+                            using (var card = this.RenderCurrentBotFrame(tick))
                             {
                                 this.RecordingsManager.SavePhoto(card, "05_bot_broadcast_preview");
                             }
@@ -937,13 +996,7 @@ namespace TeamsCallingBot.Bot
 
                 try
                 {
-                    using (var card = VideoFrameConverter.CreateBotStatusCard(
-                        "Teams AI Assistant",
-                        this.IsMuted ? "Audio output muted - still recording" : "Recording audio and video",
-                        this.Call.Id,
-                        this.IsMuted,
-                        tick,
-                        this.activityLine))
+                    using (var card = this.RenderCurrentBotFrame(tick))
                     {
                         byte[] nv12 = VideoFrameConverter.ConvertBitmapToNV12(card, format.Width, format.Height);
 
@@ -962,6 +1015,146 @@ namespace TeamsCallingBot.Bot
                         this.graphLogger.Warn($"[Bot Video] Send failed: {ex.Message}");
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Picks between the normal status card and an active visualization (chart / TDA answer /
+        /// image shown on the bot's own video tile - see ShowVisualizationAsync). Caller owns and
+        /// must Dispose the returned Bitmap.
+        /// </summary>
+        private Bitmap RenderCurrentBotFrame(int tick)
+        {
+            Bitmap visualization = null;
+            string title = null;
+            lock (this.visualizationLock)
+            {
+                if (this.currentVisualization != null && DateTime.Now < this.visualizationExpiresAt)
+                {
+                    visualization = this.currentVisualization;
+                    title = this.currentVisualizationTitle;
+                }
+                else if (this.currentVisualization != null)
+                {
+                    // Expired - clear it so subsequent frames fall back to the status card.
+                    this.currentVisualization.Dispose();
+                    this.currentVisualization = null;
+                    this.currentVisualizationTitle = null;
+                }
+            }
+
+            if (visualization != null)
+            {
+                return VideoFrameConverter.CreateVisualizationFrame(visualization, title);
+            }
+
+            return VideoFrameConverter.CreateBotStatusCard(
+                "Teams AI Assistant",
+                this.IsMuted ? "Audio output muted - still recording" : "Recording audio and video",
+                this.Call.Id,
+                this.IsMuted,
+                tick,
+                this.activityLine);
+        }
+
+        /// <summary>
+        /// Shows <paramref name="contentImage"/> on the bot's outgoing video tile for
+        /// <paramref name="durationSeconds"/> seconds (0 or negative = show indefinitely until
+        /// ClearVisualization or a new call to this method). Takes ownership of contentImage (clones
+        /// it internally, caller may dispose its own copy). This is the "share screen to show
+        /// visualisation" capability - see BOT_CAPABILITY_EXPECTATIONS.md section 4, option (a).
+        /// </summary>
+        public void ShowVisualization(Bitmap contentImage, string title, int durationSeconds)
+        {
+            if (contentImage == null)
+            {
+                return;
+            }
+
+            var clone = (Bitmap)contentImage.Clone();
+            lock (this.visualizationLock)
+            {
+                this.currentVisualization?.Dispose();
+                this.currentVisualization = clone;
+                this.currentVisualizationTitle = title;
+                this.visualizationExpiresAt = durationSeconds > 0
+                    ? DateTime.Now.AddSeconds(durationSeconds)
+                    : DateTime.MaxValue;
+            }
+
+            this.Log($"[Visualization] Showing '{title}' on bot video tile" + (durationSeconds > 0 ? $" for {durationSeconds}s." : " indefinitely."));
+        }
+
+        /// <summary>Reverts the bot's video tile to the normal status card immediately.</summary>
+        public void ClearVisualization()
+        {
+            lock (this.visualizationLock)
+            {
+                this.currentVisualization?.Dispose();
+                this.currentVisualization = null;
+                this.currentVisualizationTitle = null;
+                this.visualizationExpiresAt = DateTime.MinValue;
+            }
+        }
+
+        // ===================================================================
+        // TDA (Tata Steel Digital Assistant) integration - inert unless Bot:Tda:Enabled is true.
+        // See Config/BotOptions.cs (TdaOptions) and Tda/TdaClient.cs.
+        // ===================================================================
+
+        /// <summary>
+        /// Asks TDA <paramref name="query"/> and speaks the answer into the meeting. No-ops (logs and
+        /// returns false) if TDA is not configured/enabled, if AudioSender is unavailable, or if TDA
+        /// returns nothing - never throws into the caller.
+        /// </summary>
+        public async Task<bool> SpeakTdaAnswerAsync(string query)
+        {
+            if (!this.tdaClient.IsConfigured)
+            {
+                this.graphLogger.Warn("[TDA] SpeakTdaAnswerAsync called but TDA is not enabled/configured - no-op.");
+                return false;
+            }
+
+            try
+            {
+                string answer = await this.tdaClient.AskAsync(query).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(answer))
+                {
+                    return false;
+                }
+
+                if (this.AudioSender != null && !this.IsMuted)
+                {
+                    await this.AudioSender.SpeakAsync(answer).ConfigureAwait(false);
+                }
+
+                this.Timeline.AddEvent("tda_answer_spoken", answer);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[TDA] SpeakTdaAnswerAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>Sends a message to TDA using a token scoped to the "TSL AI" resource. False/no-op if not configured.</summary>
+        public async Task<bool> SendTdaMessageAsync(string message)
+        {
+            if (!this.tdaClient.IsConfigured)
+            {
+                this.graphLogger.Warn("[TDA] SendTdaMessageAsync called but TDA is not enabled/configured - no-op.");
+                return false;
+            }
+
+            try
+            {
+                return await this.tdaClient.SendMessageAsync(message).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[TDA] SendTdaMessageAsync failed: {ex.Message}");
+                return false;
             }
         }
 
@@ -1424,9 +1617,10 @@ namespace TeamsCallingBot.Bot
             {
                 try
                 {
+                    // 16 kHz, 16-bit mono WAV = 32,000 bytes/second of PCM after the 44-byte header
                     var talkTimeByName = speakerAudios.ToDictionary(
                         s => this.ResolveSpeakerName(s.SpeakerId),
-                        s => s.TotalDurationSeconds,
+                        s => System.IO.File.Exists(s.WavPath) ? Math.Max(0, new FileInfo(s.WavPath).Length - 44) / 32000.0 : 0.0,
                         StringComparer.OrdinalIgnoreCase);
 
                     var momResult = await TeamsCallingBot.Mom.MomGenerator.GenerateAsync(
@@ -1439,6 +1633,26 @@ namespace TeamsCallingBot.Bot
 
                     this.graphLogger.Info($"[MoM] Generated {momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath} (AI: {momResult.UsedAi})");
                     Console.WriteLine($">>> [MoM] Generated {(momResult.UsedAi ? "AI-enhanced" : "local")} Minutes of Meeting -> {Path.GetFileName(momResult.DocxPath ?? momResult.MarkdownPath ?? momResult.JsonPath)}");
+
+                    // 6a. Upload the MoM doc (and, if configured, the transcript files) to GCS and get
+                    // signed links, then hand off ONE combined notification (summary + link) to the
+                    // Cloud Run relay - the VM never talks to Power Automate/email directly (see
+                    // PRODUCTION_STATUS.md §4). Both steps are best-effort - failures here never
+                    // affect the local files already saved above.
+                    if (!string.IsNullOrWhiteSpace(momResult.DocxPath))
+                    {
+                        var gcsUploader = new GcsUploader(this.options.Gcs, msg => this.RecordingsManager.Log(msg));
+                        string signedUrl = await gcsUploader.UploadMomDocumentAsync(momResult.DocxPath, this.Call.Id, this.chatThreadId).ConfigureAwait(false);
+                        await gcsUploader.UploadTranscriptFilesAsync(this.RecordingsManager.SessionDirectory, this.Call.Id, this.chatThreadId).ConfigureAwait(false);
+
+                        var relayClient = new CloudRunRelayClient(this.options.CloudRunRelay, msg => this.RecordingsManager.Log(msg));
+                        await relayClient.SendMomNotificationAsync(
+                            momResult.Document,
+                            this.chatThreadId,
+                            signedUrl,
+                            this.options.Gcs?.SignedUrlExpiryHours ?? 168,
+                            momResult.UsedAi).ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1547,6 +1761,11 @@ namespace TeamsCallingBot.Bot
 
             this.chatClient?.Dispose();
             this.latestScreenBitmap?.Dispose();
+            lock (this.visualizationLock)
+            {
+                this.currentVisualization?.Dispose();
+                this.currentVisualization = null;
+            }
         }
     }
 }

@@ -35,13 +35,6 @@
     <Reference Include="System.IO.Compression" />
   </ItemGroup>
 
-  <!-- PARKED (2026-09-04, POC focus is video): the Minutes-of-Meeting / Word document generator in
-       Mom\ is complete but excluded from compilation until the video POC is signed off. Remove this
-       line to build it in (see docs/VIDEO_RECORDING_AND_MOM.md). -->
-  <ItemGroup>
-    <Compile Remove="Mom\**" />
-  </ItemGroup>
-
   <!--
     NOT yet added (install these yourself via NuGet Package Manager -> Browse -> install latest stable,
     since these versions were not verified against a real source file and I don't want to guess wrong):
