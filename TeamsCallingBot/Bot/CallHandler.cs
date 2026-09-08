@@ -74,10 +74,10 @@ namespace TeamsCallingBot.Bot
         // Periodic Audio Flush
         private CancellationTokenSource periodicFlushCts;
 
-        // Auto-Leave Timer
+        // Auto-Leave Timer (Generous 10-minute grace period so bot stays alive and visible while waiting)
         private CancellationTokenSource autoLeaveCts;
-        private const int AutoLeaveDebounceSeconds = 30;
-        private const int InitialGracePeriodSeconds = 45;
+        private const int AutoLeaveDebounceSeconds = 120;
+        private const int InitialGracePeriodSeconds = 600;
 
         // Chat Info
         private readonly string chatThreadId;
