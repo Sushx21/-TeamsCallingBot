@@ -17,6 +17,8 @@ namespace TeamsCallingBot.Audio
         public string WavPath { get; set; }
 
         public DateTime FirstSeenAt { get; set; }
+
+        public double TotalDurationSeconds { get; set; }
     }
 
     public class AudioAggregator
@@ -99,7 +101,7 @@ namespace TeamsCallingBot.Audio
                 var path = Path.Combine(targetDir, filename);
 
                 WriteWavFile(path, kvp.Value);
-                result.Add(new SpeakerAudio { SpeakerId = kvp.Key, WavPath = path, FirstSeenAt = firstSeenAt[kvp.Key] });
+                result.Add(new SpeakerAudio { SpeakerId = kvp.Key, WavPath = path, FirstSeenAt = firstSeenAt[kvp.Key], TotalDurationSeconds = kvp.Value.Length / 32000.0 });
             }
 
             // 2. Write combined mixed WAV (both ways)
@@ -160,7 +162,7 @@ namespace TeamsCallingBot.Audio
                 var path = Path.Combine(targetDir, filename);
 
                 WriteWavFile(path, kvp.Value);
-                result.Add(new SpeakerAudio { SpeakerId = kvp.Key, WavPath = path, FirstSeenAt = firstSeenAt[kvp.Key] });
+                result.Add(new SpeakerAudio { SpeakerId = kvp.Key, WavPath = path, FirstSeenAt = firstSeenAt[kvp.Key], TotalDurationSeconds = kvp.Value.Length / 32000.0 });
             }
 
             // 2. Write combined mixed WAV (both ways)

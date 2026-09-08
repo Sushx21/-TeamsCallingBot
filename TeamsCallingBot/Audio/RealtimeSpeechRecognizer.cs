@@ -41,6 +41,12 @@ namespace TeamsCallingBot.Audio
         /// </summary>
         public event Action<string, string, string> OnTriggerDetected;
 
+        /// <summary>
+        /// Event fired whenever any spoken text is recognized in real time.
+        /// Parameters: (recognizedText, timestamp)
+        /// </summary>
+        public event Action<string, DateTime> OnSpeechRecognized;
+
         public RealtimeSpeechRecognizer(IGraphLogger logger, Func<bool> isBotSpeakingFunc = null)
         {
             this.logger = logger;
@@ -227,6 +233,7 @@ namespace TeamsCallingBot.Audio
             string lower = text.ToLowerInvariant();
             this.logger?.Info($"[RealtimeSpeechRecognizer] Recognized: \"{text}\"");
             Console.WriteLine($">>> [Voice Recognizer] Heard: \"{text}\"");
+            try { this.OnSpeechRecognized?.Invoke(text, DateTime.Now); } catch { }
 
             bool isTrigger = lower.Contains("tda") || lower.Contains("bot") ||
                              lower.Contains("tito") || lower.Contains("tita") ||

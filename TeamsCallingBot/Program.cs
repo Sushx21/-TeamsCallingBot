@@ -56,6 +56,25 @@ namespace TeamsCallingBot
                 }
             });
 
+            AppDomain.CurrentDomain.ProcessExit += (s, e) =>
+            {
+                try
+                {
+                    var bot = host.Services.GetService<TeamsCallingBot.Bot.Bot>();
+                    bot?.Dispose();
+                }
+                catch { }
+            };
+            Console.CancelKeyPress += (s, e) =>
+            {
+                try
+                {
+                    var bot = host.Services.GetService<TeamsCallingBot.Bot.Bot>();
+                    bot?.Dispose();
+                }
+                catch { }
+            };
+
             host.Run();
         }
 

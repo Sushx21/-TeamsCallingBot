@@ -90,6 +90,10 @@ namespace TeamsCallingBot.Bot
         {
             this.Client.Calls().OnUpdated -= this.CallsOnUpdated;
             this.Client.Calls().OnIncoming -= this.CallsOnIncoming;
+            foreach (var handler in this.CallHandlers.Values)
+            {
+                try { handler.Dispose(); } catch { }
+            }
             this.Client?.Dispose();
             this.concurrentCallSlots.Dispose();
         }
