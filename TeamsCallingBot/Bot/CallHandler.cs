@@ -52,10 +52,19 @@ namespace TeamsCallingBot.Bot
         public RecordingsManager RecordingsManager { get; }
 
         // State Flags
-        public bool IsMuted { get; private set; } = false;
+        public bool IsMuted { get; private set; } = true;
         private volatile bool isVideoSendActive = false;
         private volatile bool isKeyFrameNeeded = true;
         private int joinWelcomeSent = 0;
+
+        // TDA integration
+        private readonly TeamsCallingBot.Tda.TdaClient tdaClient;
+
+        // Visualization
+        private readonly object visualizationLock = new object();
+        private Bitmap currentVisualization;
+        private string currentVisualizationTitle;
+        private DateTime visualizationExpiresAt;
 
         // Screen & Video Capture Throttling (independent throttles so screen capture isn't starved)
         private DateTime lastVbssPhotoTime = DateTime.MinValue;
@@ -101,6 +110,9 @@ namespace TeamsCallingBot.Bot
             this.RecordingsManager = new RecordingsManager(this.Call.Id);
             this.AudioAggregator = new AudioAggregator();
 
+            var tdaTokenProvider = new TeamsCallingBot.Tda.TdaTokenProvider(BotOptions.Current?.Tda, BotOptions.Current?.AadAppId, BotOptions.Current?.AadAppSecretOrCertThumbprint, this.graphLogger);
+            this.tdaClient = new TeamsCallingBot.Tda.TdaClient(BotOptions.Current?.Tda, tdaTokenProvider, this.graphLogger);
+
             // 2. Wire Call Events
             this.Call.OnUpdated += this.OnCallUpdated;
             this.Call.Participants.OnUpdated += this.OnParticipantsUpdated;
@@ -115,8 +127,9 @@ namespace TeamsCallingBot.Bot
                 {
                     this.audioSocket.AudioMediaReceived += this.OnAudioMediaReceived;
                     this.AudioSender = new AudioSender(this.audioSocket, this.graphLogger);
+                    this.AudioSender.IsMuted = this.IsMuted;
 
-                    // Play pleasant greeting chime + verbal announcement when audio send is active
+                    // Play pleasant greeting chime + verbal announcement when audio send is active (only if unmuted)
                     _ = Task.Run(async () =>
                     {
                         for (int i = 0; i < 30; i++)
@@ -128,7 +141,7 @@ namespace TeamsCallingBot.Bot
                             await Task.Delay(200).ConfigureAwait(false);
                         }
 
-                        if (this.AudioSender != null && this.AudioSender.IsAudioSendActive)
+                        if (!this.IsMuted && this.AudioSender != null && this.AudioSender.IsAudioSendActive)
                         {
                             await Task.Delay(500).ConfigureAwait(false);
                             await this.AudioSender.PlayGreetingAsync().ConfigureAwait(false);
@@ -1309,6 +1322,77 @@ namespace TeamsCallingBot.Bot
         protected override Task HeartbeatAsync(ElapsedEventArgs args)
         {
             return this.Call.KeepAliveAsync();
+        }
+
+        public void ShowVisualization(Bitmap contentImage, string title, int durationSeconds)
+        {
+            if (contentImage == null) return;
+            var clone = (Bitmap)contentImage.Clone();
+            lock (this.visualizationLock)
+            {
+                this.currentVisualization?.Dispose();
+                this.currentVisualization = clone;
+                this.currentVisualizationTitle = title;
+                this.visualizationExpiresAt = durationSeconds > 0
+                    ? DateTime.Now.AddSeconds(durationSeconds)
+                    : DateTime.MaxValue;
+            }
+        }
+
+        public void ClearVisualization()
+        {
+            lock (this.visualizationLock)
+            {
+                this.currentVisualization?.Dispose();
+                this.currentVisualization = null;
+                this.currentVisualizationTitle = null;
+            }
+        }
+
+        public async Task<bool> SpeakTdaAnswerAsync(string query)
+        {
+            if (this.tdaClient == null || !this.tdaClient.IsConfigured)
+            {
+                this.graphLogger.Warn("[TDA] SpeakTdaAnswerAsync called but TDA is not enabled/configured - no-op.");
+                return false;
+            }
+
+            try
+            {
+                string answer = await this.tdaClient.AskAsync(query).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(answer)) return false;
+
+                if (this.AudioSender != null && !this.IsMuted)
+                {
+                    await this.AudioSender.SpeakAsync(answer).ConfigureAwait(false);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[TDA] SpeakTdaAnswerAsync failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        public async Task<bool> SendTdaMessageAsync(string message)
+        {
+            if (this.tdaClient == null || !this.tdaClient.IsConfigured)
+            {
+                this.graphLogger.Warn("[TDA] SendTdaMessageAsync called but TDA is not enabled/configured - no-op.");
+                return false;
+            }
+
+            try
+            {
+                return await this.tdaClient.SendMessageAsync(message).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[TDA] SendTdaMessageAsync failed: {ex.Message}");
+                return false;
+            }
         }
 
         protected override void Dispose(bool disposing)
