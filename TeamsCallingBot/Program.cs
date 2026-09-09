@@ -57,31 +57,36 @@ namespace TeamsCallingBot
                             }
                         }
 
-                        // Scheduled meetings section: Bot:ScheduledMeetings: [ { MeetingJoinUrl, ScheduledStartTimeUtc } ]
-                        var scheduledSection = config.GetSection("Bot:ScheduledMeetings").GetChildren();
-                        foreach (var item in scheduledSection)
+                        // Scheduled meetings from MeetingRegistryService (Power Automate & Calendar Forwarding)
+                        var registry = host.Services.GetService<TeamsCallingBot.Common.MeetingRegistryService>();
+                        if (registry != null)
                         {
-                            var sUrl = item["MeetingJoinUrl"]?.Trim();
-                            var sTimeStr = item["ScheduledStartTimeUtc"]?.Trim();
-
-                            if (!string.IsNullOrWhiteSpace(sUrl))
+                            var pending = registry.GetPendingMeetingsToJoin(DateTime.UtcNow);
+                            foreach (var p in pending)
                             {
-                                if (DateTime.TryParse(sTimeStr, out var sTimeUtc))
+                                if (!joinedUrls.Contains(p.Id))
                                 {
-                                    // If within 2 minutes before scheduled start time or up to 60 minutes after
-                                    var diff = DateTime.UtcNow - sTimeUtc.ToUniversalTime();
-                                    if (diff.TotalMinutes >= -2.0 && diff.TotalMinutes <= 60.0)
+                                    joinedUrls.Add(p.Id);
+                                    registry.MarkJoining(p.Id);
+                                    _ = Task.Run(async () =>
                                     {
-                                        if (!joinedUrls.Contains(sUrl))
+                                        Console.WriteLine($">>> [Scheduler] Triggering registered meeting: '{p.Subject}' (Video: {p.RecordVideo}) | {p.MeetingJoinUrl ?? p.ThreadId}");
+                                        try
                                         {
-                                            Console.WriteLine($">>> [Scheduler] Scheduled meeting trigger matched! Scheduled: {sTimeUtc:u}, Now: {DateTime.UtcNow:u}. Auto-joining: {sUrl}");
-                                            urlsToJoin.Add(sUrl);
+                                            var call = !string.IsNullOrWhiteSpace(p.MeetingJoinUrl)
+                                                ? await bot.JoinCallAsync(p.MeetingJoinUrl, p.RecordVideo).ConfigureAwait(false)
+                                                : await bot.JoinCallByCoordinatesAsync(p.ThreadId, recordVideo: p.RecordVideo).ConfigureAwait(false);
+
+                                            registry.MarkJoined(p.Id, call.Id);
+                                            Console.WriteLine($">>> [Scheduler] Registered meeting joined: '{p.Subject}' (CallId: {call.Id})");
                                         }
-                                    }
-                                }
-                                else
-                                {
-                                    urlsToJoin.Add(sUrl);
+                                        catch (Exception ex)
+                                        {
+                                            registry.MarkFailed(p.Id, ex.Message);
+                                            joinedUrls.Remove(p.Id);
+                                            Console.WriteLine($">>> [Scheduler] Registered meeting join failed: '{p.Subject}': {ex.Message}");
+                                        }
+                                    });
                                 }
                             }
                         }
