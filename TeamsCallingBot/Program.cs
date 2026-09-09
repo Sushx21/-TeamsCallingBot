@@ -36,23 +36,49 @@ namespace TeamsCallingBot
                 await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
 
                 var config = host.Services.GetRequiredService<IConfiguration>();
+                var urls = new System.Collections.Generic.List<string>();
+
                 var testUrl = config["Bot:TestMeetingJoinUrl"];
-                if (string.IsNullOrWhiteSpace(testUrl))
+                if (!string.IsNullOrWhiteSpace(testUrl))
+                {
+                    var split = testUrl.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                       .Select(u => u.Trim())
+                                       .Where(u => !string.IsNullOrWhiteSpace(u));
+                    urls.AddRange(split);
+                }
+
+                var multiSection = config.GetSection("Bot:TestMeetingJoinUrls").GetChildren();
+                foreach (var child in multiSection)
+                {
+                    if (!string.IsNullOrWhiteSpace(child.Value))
+                    {
+                        urls.Add(child.Value.Trim());
+                    }
+                }
+
+                urls = urls.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+                if (urls.Count == 0)
                 {
                     return;
                 }
 
-                Console.WriteLine($">>> TEST JOIN starting for: {testUrl}");
-                try
+                var bot = host.Services.GetRequiredService<TeamsCallingBot.Bot.Bot>();
+                foreach (var url in urls)
                 {
-                    var bot = host.Services.GetRequiredService<TeamsCallingBot.Bot.Bot>();
-                    var call = await bot.JoinCallAsync(testUrl).ConfigureAwait(false);
-                    Console.WriteLine($">>> TEST JOIN accepted. Call id: {call.Id}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($">>> TEST JOIN FAILED: {ex.GetType().Name}: {ex.Message}");
-                    Console.WriteLine(ex.ToString());
+                    _ = Task.Run(async () =>
+                    {
+                        Console.WriteLine($">>> TEST JOIN starting for: {url}");
+                        try
+                        {
+                            var call = await bot.JoinCallAsync(url).ConfigureAwait(false);
+                            Console.WriteLine($">>> TEST JOIN accepted. Call id: {call.Id}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($">>> TEST JOIN FAILED for {url}: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    });
                 }
             });
 

@@ -130,7 +130,7 @@ namespace TeamsCallingBot.Bot
 
         public ICall Call { get; }
 
-        public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null)
+        public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null, string meetingJoinUrl = null)
             : base(TimeSpan.FromMinutes(1), logger)
         {
             this.Call = call ?? throw new ArgumentNullException(nameof(call));
@@ -145,6 +145,16 @@ namespace TeamsCallingBot.Bot
             // call id for 1:1 calls with no thread). Lets artifacts be tied to a specific meeting,
             // which matters when several meetings are recorded concurrently.
             this.RecordingsManager = new RecordingsManager(this.Call.Id, this.chatThreadId);
+            try
+            {
+                var linkPath = Path.Combine(this.RecordingsManager.SessionDirectory, "meeting_link.txt");
+                var meetingLink = !string.IsNullOrWhiteSpace(meetingJoinUrl)
+                    ? meetingJoinUrl
+                    : (this.chatThreadId ?? this.Call?.Id ?? "unknown");
+                System.IO.File.WriteAllText(linkPath, meetingLink, Encoding.UTF8);
+                this.RecordingsManager.Log($"[Meeting Link Saved] {meetingLink}");
+            }
+            catch { }
             this.AudioAggregator = new AudioAggregator();
             this.Timeline = new MeetingTimeline { CallId = this.Call.Id, ChatThreadId = chatThreadId, StartedAt = this.sessionStartTime };
             this.chatClient = new BotFrameworkChatClient(this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.options.BotFrameworkServiceUrl, this.graphLogger);
@@ -197,7 +207,7 @@ namespace TeamsCallingBot.Bot
                 }
 
                 // VBSS Socket (Screen Sharing Video Recording)
-                this.vbssSocket = localMediaSession.VideoSockets?.FirstOrDefault(s => s.MediaType == MediaType.Vbss);
+                this.vbssSocket = localMediaSession.VbssSocket ?? localMediaSession.VideoSockets?.FirstOrDefault(s => s.MediaType == MediaType.Vbss);
                 if (this.vbssSocket != null)
                 {
                     this.vbssSocket.VideoReceiveStatusChanged += this.OnVbssReceiveStatusChanged;
@@ -651,15 +661,18 @@ namespace TeamsCallingBot.Bot
                     return;
                 }
 
-                if (recorder == null && this.options.RecordParticipantVideo)
+                if (this.options.RecordParticipantVideo)
                 {
-                    var who = this.ResolveParticipantByMsi(e.Buffer.MediaSourceId);
-                    this.StartCameraRecorder(e.Buffer.MediaSourceId, who.DisplayName, who.ParticipantId);
-                    this.cameraRecorder?.OnFrame(e.Buffer);
-                    return;
-                }
+                    if (recorder == null)
+                    {
+                        var who = this.ResolveParticipantByMsi(e.Buffer.MediaSourceId);
+                        this.StartCameraRecorder(e.Buffer.MediaSourceId, who.DisplayName, who.ParticipantId);
+                        this.cameraRecorder?.OnFrame(e.Buffer);
+                        return;
+                    }
 
-                this.SavePhotoThrottled(e.Buffer, "03_photo_video");
+                    this.SavePhotoThrottled(e.Buffer, "03_photo_video");
+                }
             }
             catch (Exception ex)
             {
@@ -785,6 +798,7 @@ namespace TeamsCallingBot.Bot
 
                         if (this.options.RecordScreenShare)
                         {
+                            this.activityLine = $"Recording screen share from {name}";
                             this.StartVbssRecorder(sharerMsi, name, sharer?.Id);
                         }
                     }
@@ -801,12 +815,13 @@ namespace TeamsCallingBot.Bot
                         }
 
                         this.currentVbssMsi = 0;
+                        this.activityLine = "Listening • No active screen share";
                         this.StopVbssRecorder("presenter stopped sharing");
                     }
                 }
 
                 // ---- Camera video ---------------------------------------------------------------
-                if (this.videoSocket != null)
+                if (this.videoSocket != null && this.options.RecordParticipantVideo)
                 {
                     if (cameraMsi != 0 && cameraMsi != this.currentCameraMsi)
                     {
@@ -816,15 +831,11 @@ namespace TeamsCallingBot.Bot
                             this.videoSocket.Subscribe(VideoResolution.HD720p, cameraMsi);
                             this.currentCameraMsi = cameraMsi;
                             this.Log($"[Video Socket] Subscribed to camera of '{name}' (MSI {cameraMsi}).");
+                            this.StartCameraRecorder(cameraMsi, name, cameraOwner?.Id);
                         }
                         catch (Exception ex)
                         {
                             this.Log($"[Video Socket] Subscribe to MSI {cameraMsi} failed: {ex.Message}");
-                        }
-
-                        if (this.options.RecordParticipantVideo)
-                        {
-                            this.StartCameraRecorder(cameraMsi, name, cameraOwner?.Id);
                         }
                     }
                     else if (cameraMsi == 0 && this.currentCameraMsi != 0)
@@ -913,18 +924,8 @@ namespace TeamsCallingBot.Bot
 
         private void OnVoiceSpeechRecognized(string text, DateTime timestamp)
         {
-            if (string.IsNullOrWhiteSpace(text)) return;
-            lock (this.liveTranscriptLock)
-            {
-                this.liveTranscriptEntries.Add(new TranscriptEntry
-                {
-                    Timestamp = timestamp.ToString("yyyy-MM-dd HH:mm:ss"),
-                    Speaker = "Speaker (Real-time)",
-                    Transcript = text.Trim()
-                });
-
-                this.RecordingsManager.SaveTranscripts(new List<TranscriptEntry>(this.liveTranscriptEntries));
-            }
+            // Note: Accurate meeting transcripts are produced by Whisper in UpdateLiveTranscriptsAsync.
+            // SAPI is used only for rapid keyword detection (e.g. "tda bot") via OnTriggerDetected.
         }
 
         // ===================================================================
@@ -975,7 +976,7 @@ namespace TeamsCallingBot.Bot
                 try
                 {
                     using (var previewCard = VideoFrameConverter.CreateBotStatusCard(
-                        "Teams AI Assistant",
+                        "TDA Assistant",
                         this.IsMuted ? "Audio output muted - still recording" : "Recording audio and video",
                         this.Call.Id,
                         this.IsMuted,
@@ -1072,13 +1073,17 @@ namespace TeamsCallingBot.Bot
                         }
                     }
 
+                    string currentStatus = this.currentVbssMsi != 0
+                        ? "Recording screen share (MP4)"
+                        : (this.IsMuted ? "Audio output muted - still recording" : "Recording audio and screen share");
+
                     using (var card = customVis != null
                         ? VideoFrameConverter.CreateVisualizationFrame(
                             customVis,
                             customTitle ?? "TDA Analysis")
                         : VideoFrameConverter.CreateBotStatusCard(
-                            "Teams AI Assistant",
-                            this.IsMuted ? "Audio output muted - still recording" : "Recording audio and video",
+                            "TDA Assistant",
+                            currentStatus,
                             this.Call.Id,
                             this.IsMuted,
                             tick,
@@ -1752,11 +1757,38 @@ namespace TeamsCallingBot.Bot
             //    per-speaker durations used for talk-time below).
             var speakerAudios = this.AudioAggregator.FlushToWavFiles(this.RecordingsManager.SessionDirectory);
 
-            // The complete transcript now lives in liveTranscriptEntries (live increments + final tail).
+            // The complete transcript lives in liveTranscriptEntries (live increments + final tail).
             var entries = new List<TranscriptEntry>();
             lock (this.liveTranscriptLock)
             {
                 entries.AddRange(this.liveTranscriptEntries);
+            }
+
+            // High-fidelity full-session audio pass with Whisper to ensure complete, clean transcript
+            try
+            {
+                var fullWav = Path.Combine(this.RecordingsManager.SessionDirectory, "02_audio_meeting_both_ways.wav");
+                if (System.IO.File.Exists(fullWav))
+                {
+                    string fullText = await WhisperTranscriber.TranscribeAsync(fullWav).ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(fullText))
+                    {
+                        if (entries.Count == 0)
+                        {
+                            entries.Add(new TranscriptEntry
+                            {
+                                Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                                Speaker = "Meeting Audio",
+                                Transcript = fullText
+                            });
+                        }
+                        System.IO.File.WriteAllText(Path.Combine(this.RecordingsManager.SessionDirectory, "04_transcript_full_meeting.txt"), fullText, Encoding.UTF8);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[Transcript] Full audio transcription pass failed: {ex.Message}");
             }
 
             // 3. Save Transcripts (.txt and .json)

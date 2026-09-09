@@ -187,7 +187,7 @@ namespace TeamsCallingBot.Bot
                 CallHandler handler;
                 try
                 {
-                    handler = new CallHandler(call, this.graphLogger, chatInfo?.ThreadId, this.options?.OverrideBearerToken);
+                    handler = new CallHandler(call, this.graphLogger, chatInfo?.ThreadId, this.options?.OverrideBearerToken, meetingJoinUrl);
                 }
                 catch (Exception ex)
                 {

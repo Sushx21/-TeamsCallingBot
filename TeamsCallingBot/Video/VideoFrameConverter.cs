@@ -5,6 +5,7 @@ namespace TeamsCallingBot.Video
     using System.Drawing.Drawing2D;
     using System.Drawing.Imaging;
     using System.IO;
+    using System.Linq;
     using System.Runtime.InteropServices;
 
     /// <summary>
@@ -324,83 +325,81 @@ namespace TeamsCallingBot.Video
         /// </summary>
         public static Bitmap CreateBotStatusCard(string botName, string statusMessage, string meetingId, bool isMuted = false, int tick = 0, string activityLine = null)
         {
-            Bitmap background = GetCardBackground(botName ?? "Teams AI Assistant");
+            Bitmap background = GetCardBackground(botName ?? "TDA Assistant");
             var bmp = (Bitmap)background.Clone();
 
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-                // REC pulse
+                int barH = 56;
+                int barY = 720 - barH;
+
+                // Screen sharing detection
+                bool isScreenSharing = (!string.IsNullOrWhiteSpace(activityLine) && activityLine.IndexOf("screen", StringComparison.OrdinalIgnoreCase) >= 0)
+                    || (!string.IsNullOrWhiteSpace(statusMessage) && statusMessage.IndexOf("screen", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                // REC badge in top right
                 bool pulse = (tick % 2 == 0);
-                Color recColor = pulse ? Color.FromArgb(239, 68, 68) : Color.FromArgb(185, 28, 28);
-                using (var recBrush = new SolidBrush(recColor))
+                Color recDotColor = pulse ? Color.FromArgb(239, 68, 68) : Color.FromArgb(185, 28, 28);
+                using (var recBg = new SolidBrush(Color.FromArgb(200, 10, 18, 36)))
+                using (var recBrush = new SolidBrush(recDotColor))
+                using (var recFont = new Font("Segoe UI", 12, FontStyle.Bold))
+                using (var recTextBrush = new SolidBrush(Color.White))
                 {
-                    g.FillEllipse(recBrush, 1070, 95, 16, 16);
+                    g.FillRectangle(recBg, 1150, 16, 110, 32);
+                    g.FillEllipse(recBrush, 1162, 26, 12, 12);
+                    g.DrawString("REC", recFont, recTextBrush, 1182, 22);
                 }
 
-                // Status pill
-                int pillX = 365;
-                int pillY = 240;
-                int pillW = isMuted ? 140 : 260;
-                int pillH = 38;
-                Color pillBg = isMuted ? Color.FromArgb(127, 29, 29) : Color.FromArgb(6, 78, 59);
-                Color pillBorder = isMuted ? Color.FromArgb(239, 68, 68) : Color.FromArgb(16, 185, 129);
-                Color pillText = isMuted ? Color.FromArgb(254, 202, 202) : Color.FromArgb(167, 243, 208);
-                string pillLabel = isMuted ? "● MUTED" : "● ACTIVE & LISTENING";
-
-                using (var pillBrush = new SolidBrush(pillBg))
-                using (var pillPen = new Pen(pillBorder, 1.5f))
+                // Sleek modern bottom status bar
+                using (var barBg = new SolidBrush(Color.FromArgb(235, 12, 22, 42)))
                 {
-                    g.FillRectangle(pillBrush, pillX, pillY, pillW, pillH);
-                    g.DrawRectangle(pillPen, pillX, pillY, pillW, pillH);
+                    g.FillRectangle(barBg, 0, barY, 1280, barH);
                 }
 
-                using (var pillFont = new Font("Segoe UI", 13, FontStyle.Bold))
-                using (var labelBrush = new SolidBrush(pillText))
+                // Top accent line on bar
+                Color accentColor = isScreenSharing ? Color.FromArgb(56, 189, 248) : Color.FromArgb(16, 185, 129);
+                using (var accentPen = new Pen(accentColor, 2f))
                 {
-                    g.DrawString(pillLabel, pillFont, labelBrush, new PointF(pillX + 15, pillY + 8));
+                    g.DrawLine(accentPen, 0, barY, 1280, barY);
                 }
 
-                // Waveform bars
-                int barStartX = 650;
-                int barY = 240;
-                using (var barBrush = new SolidBrush(Color.FromArgb(56, 189, 248)))
+                // Title & branding on left
+                using (var dotBrush = new SolidBrush(isMuted ? Color.FromArgb(239, 68, 68) : accentColor))
+                using (var titleFont = new Font("Segoe UI", 13, FontStyle.Bold))
+                using (var textBrush = new SolidBrush(Color.White))
                 {
-                    for (int i = 0; i < 16; i++)
-                    {
-                        double wave = Math.Abs(Math.Sin((tick * 0.3) + (i * 0.5)));
-                        int barH = isMuted ? 4 : (int)(wave * 30) + 6;
-                        int currentBarY = barY + (38 - barH) / 2;
-                        g.FillRectangle(barBrush, barStartX + (i * 12), currentBarY, 7, barH);
-                    }
+                    g.FillEllipse(dotBrush, 24, barY + 20, 14, 14);
+                    g.DrawString("TDA ASSISTANT  •  TATA STEEL", titleFont, textBrush, 48, barY + 16);
                 }
 
-                using (var fontDetails = new Font("Segoe UI", 15, FontStyle.Regular))
-                using (var fontDetailsBold = new Font("Segoe UI", 15, FontStyle.Bold))
-                using (var labelBrush = new SolidBrush(Color.FromArgb(100, 116, 139)))
-                using (var valBrush = new SolidBrush(Color.FromArgb(226, 232, 240)))
-                using (var accentBrush = new SolidBrush(Color.FromArgb(125, 211, 252)))
+                // Dynamic Status on right
+                string statusText;
+                Color statusTextColor;
+                if (isMuted)
                 {
-                    g.DrawString("Call Session ID:", fontDetailsBold, labelBrush, new PointF(140, 400));
-                    g.DrawString(meetingId ?? string.Empty, fontDetails, valBrush, new PointF(330, 400));
+                    statusText = "● MUTED";
+                    statusTextColor = Color.FromArgb(248, 113, 113);
+                }
+                else if (isScreenSharing)
+                {
+                    statusText = "● RECORDING SCREEN SHARE (MP4)";
+                    statusTextColor = Color.FromArgb(56, 189, 248);
+                }
+                else
+                {
+                    statusText = "● ACTIVE & LISTENING | Screen Share & MoM Ready";
+                    statusTextColor = Color.FromArgb(52, 211, 153);
+                }
 
-                    g.DrawString("Media Services:", fontDetailsBold, labelBrush, new PointF(140, 445));
-                    g.DrawString("Per-speaker audio, screen-share video recording, minutes of meeting", fontDetails, valBrush, new PointF(330, 445));
-
-                    g.DrawString("Operational State:", fontDetailsBold, labelBrush, new PointF(140, 490));
-                    string opState = statusMessage ?? (isMuted ? "Audio output muted - still capturing" : "Recording audio and video");
-                    g.DrawString(opState, fontDetails, valBrush, new PointF(330, 490));
-
-                    g.DrawString("Local Timestamp:", fontDetailsBold, labelBrush, new PointF(140, 535));
-                    g.DrawString(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), fontDetails, valBrush, new PointF(330, 535));
-
-                    if (!string.IsNullOrWhiteSpace(activityLine))
-                    {
-                        g.DrawString("Activity:", fontDetailsBold, labelBrush, new PointF(140, 575));
-                        g.DrawString(activityLine, fontDetails, accentBrush, new PointF(330, 575));
-                    }
+                using (var statusFont = new Font("Segoe UI", 11, FontStyle.Bold))
+                using (var statusBrush = new SolidBrush(statusTextColor))
+                {
+                    var sz = g.MeasureString(statusText, statusFont);
+                    g.DrawString(statusText, statusFont, statusBrush, 1280 - sz.Width - 24, barY + 18);
                 }
             }
 
@@ -488,110 +487,56 @@ namespace TeamsCallingBot.Video
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
-                using (var bgBrush = new LinearGradientBrush(new Rectangle(0, 0, 1280, 720), Color.FromArgb(15, 23, 42), Color.FromArgb(30, 41, 59), 45f))
+                string[] candidateMascotPaths = new[]
                 {
-                    g.FillRectangle(bgBrush, 0, 0, 1280, 720);
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tda_mascot.png"),
+                    Path.Combine(Directory.GetCurrentDirectory(), "tda_mascot.png"),
+                    @"C:\Users\jaidevlalgame\Downloads\TeamsCallingBot\TeamsCallingBot\TeamsCallingBot\tda_mascot.png",
+                    @"C:\Users\jaidevlalgame\.gemini\antigravity-ide\brain\f7426c11-f2b4-4321-b705-cc2ba3f62f2c\.user_uploaded\media_1788939608057.png"
+                };
+
+                string mascotPath = candidateMascotPaths.FirstOrDefault(File.Exists);
+                int barH = 56;
+                int availH = 720 - barH;
+
+                if (!string.IsNullOrEmpty(mascotPath))
+                {
+                    try
+                    {
+                        using (var mascot = Image.FromFile(mascotPath))
+                        {
+                            int srcX = 4;
+                            int srcY = 15;
+                            int srcW = mascot.Width - 8;
+                            int srcH = mascot.Height - 30;
+
+                            float scale = Math.Max(1280f / srcW, (float)availH / srcH);
+                            int dstW = (int)(srcW * scale);
+                            int dstH = (int)(srcH * scale);
+                            int dstX = (1280 - dstW) / 2;
+                            int dstY = (availH - dstH) / 2;
+
+                            g.DrawImage(mascot, new Rectangle(dstX, dstY, dstW, dstH), new Rectangle(srcX, srcY, srcW, srcH), GraphicsUnit.Pixel);
+                        }
+                    }
+                    catch
+                    {
+                        using (var bgBrush = new LinearGradientBrush(new Rectangle(0, 0, 1280, 720), Color.FromArgb(10, 18, 36), Color.FromArgb(20, 32, 58), 45f))
+                        {
+                            g.FillRectangle(bgBrush, 0, 0, 1280, 720);
+                        }
+                    }
                 }
-
-                using (var cardBrush = new SolidBrush(Color.FromArgb(24, 32, 50)))
-                using (var cardBorderPen = new Pen(Color.FromArgb(51, 65, 85), 2f))
+                else
                 {
-                    var cardRect = new Rectangle(80, 60, 1120, 600);
-                    g.FillRectangle(cardBrush, cardRect);
-                    g.DrawRectangle(cardBorderPen, cardRect);
-                }
-
-                using (var recFont = new Font("Segoe UI", 13, FontStyle.Bold))
-                using (var recTextBrush = new SolidBrush(Color.FromArgb(241, 245, 249)))
-                {
-                    g.DrawString("REC", recFont, recTextBrush, new PointF(1095, 92));
-                }
-
-                // Avatar
-                int iconX = 130;
-                int iconY = 140;
-                int iconSize = 190;
-
-                using (var glowPen = new Pen(Color.FromArgb(70, 56, 189, 248), 6f))
-                {
-                    g.DrawEllipse(glowPen, iconX - 5, iconY - 5, iconSize + 10, iconSize + 10);
-                }
-
-                using (var circleBrush = new LinearGradientBrush(new Rectangle(iconX, iconY, iconSize, iconSize), Color.FromArgb(14, 116, 144), Color.FromArgb(30, 58, 138), 60f))
-                {
-                    g.FillEllipse(circleBrush, iconX, iconY, iconSize, iconSize);
-                }
-
-                using (var borderPen = new Pen(Color.FromArgb(56, 189, 248), 3f))
-                {
-                    g.DrawEllipse(borderPen, iconX, iconY, iconSize, iconSize);
-                }
-
-                int headX = iconX + 45;
-                int headY = iconY + 50;
-                int headW = 100;
-                int headH = 80;
-
-                using (var headBrush = new SolidBrush(Color.FromArgb(248, 250, 252)))
-                {
-                    g.FillPie(headBrush, headX, headY - 10, headW, headH + 20, 0, 360);
-                }
-
-                using (var antennaPen = new Pen(Color.FromArgb(56, 189, 248), 4f))
-                {
-                    g.DrawLine(antennaPen, iconX + 95, iconY + 28, iconX + 95, iconY + 45);
-                }
-
-                using (var tipBrush = new SolidBrush(Color.FromArgb(56, 189, 248)))
-                {
-                    g.FillEllipse(tipBrush, iconX + 90, iconY + 20, 10, 10);
-                }
-
-                using (var visorBrush = new SolidBrush(Color.FromArgb(15, 23, 42)))
-                {
-                    g.FillRectangle(visorBrush, headX + 12, headY + 22, 76, 28);
-                }
-
-                using (var eyeBrush = new SolidBrush(Color.FromArgb(56, 189, 248)))
-                {
-                    g.FillEllipse(eyeBrush, headX + 22, headY + 26, 18, 18);
-                    g.FillEllipse(eyeBrush, headX + 60, headY + 26, 18, 18);
-                }
-
-                using (var reflectBrush = new SolidBrush(Color.White))
-                {
-                    g.FillEllipse(reflectBrush, headX + 26, headY + 29, 6, 6);
-                    g.FillEllipse(reflectBrush, headX + 64, headY + 29, 6, 6);
-                }
-
-                using (var smilePen = new Pen(Color.FromArgb(56, 189, 248), 3f))
-                {
-                    g.DrawArc(smilePen, headX + 32, headY + 54, 36, 16, 20, 140);
-                }
-
-                using (var fontTitle = new Font("Segoe UI", 34, FontStyle.Bold))
-                using (var textBrush = new SolidBrush(Color.White))
-                {
-                    g.DrawString(botName, fontTitle, textBrush, new PointF(360, 140));
-                }
-
-                using (var fontSub = new Font("Segoe UI", 16, FontStyle.Regular))
-                using (var subBrush = new SolidBrush(Color.FromArgb(148, 163, 184)))
-                {
-                    g.DrawString("Real-Time Meeting Intelligence & Media Bot", fontSub, subBrush, new PointF(365, 195));
-                }
-
-                using (var divPen = new Pen(Color.FromArgb(51, 65, 85), 1.5f))
-                {
-                    g.DrawLine(divPen, 130, 370, 1140, 370);
-                }
-
-                using (var fontFooter = new Font("Segoe UI", 12, FontStyle.Italic))
-                using (var footerBrush = new SolidBrush(Color.FromArgb(71, 85, 105)))
-                {
-                    g.DrawString("Secure Microsoft Teams Bot Platform • Media Engine Online", fontFooter, footerBrush, new PointF(140, 625));
+                    using (var bgBrush = new LinearGradientBrush(new Rectangle(0, 0, 1280, 720), Color.FromArgb(10, 18, 36), Color.FromArgb(20, 32, 58), 45f))
+                    {
+                        g.FillRectangle(bgBrush, 0, 0, 1280, 720);
+                    }
                 }
             }
 

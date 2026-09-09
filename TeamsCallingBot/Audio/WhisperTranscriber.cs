@@ -19,7 +19,22 @@ namespace TeamsCallingBot.Audio
     public static class WhisperTranscriber
     {
         private const string WhisperExecutablePath = @"C:\whisper\whisper-cli.exe";
-        private const string ModelPath = @"C:\whisper\models\ggml-small.bin";
+
+        private static string ResolveModelPath()
+        {
+            var candidates = new[]
+            {
+                @"C:\whisper\models\ggml-base.en.bin",
+                @"C:\whisper\models\ggml-small.en.bin",
+                @"C:\whisper\models\ggml-base.bin",
+                @"C:\whisper\models\ggml-small.bin",
+            };
+            foreach (var c in candidates)
+            {
+                if (File.Exists(c)) return c;
+            }
+            return @"C:\whisper\models\ggml-base.en.bin";
+        }
 
         public static async Task<string> TranscribeAsync(string wavPath)
         {
@@ -30,13 +45,13 @@ namespace TeamsCallingBot.Audio
 
             try
             {
-                // Priority 1: If whisper-cli is installed, execute it
                 if (File.Exists(WhisperExecutablePath))
                 {
+                    var modelPath = ResolveModelPath();
                     var psi = new ProcessStartInfo
                     {
                         FileName = WhisperExecutablePath,
-                        Arguments = $"-m \"{ModelPath}\" -f \"{wavPath}\" -otxt -of \"{wavPath}\"",
+                        Arguments = $"-m \"{modelPath}\" -f \"{wavPath}\" -otxt -of \"{wavPath}\" -l en --no-timestamps -sns -nth 0.65 -nf -t 4",
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         UseShellExecute = false,
@@ -52,111 +67,67 @@ namespace TeamsCallingBot.Audio
                     if (File.Exists(outputTxtPath))
                     {
                         var transcribed = File.ReadAllText(outputTxtPath);
-                        if (!string.IsNullOrWhiteSpace(transcribed))
-                        {
-                            return transcribed.Trim();
-                        }
+                        return CleanTranscript(transcribed);
                     }
                 }
 
-                // Priority 2: Windows System.Speech transcription
-                var systemSpeechText = TranscribeWithSystemSpeech(wavPath);
-                if (!string.IsNullOrWhiteSpace(systemSpeechText))
-                {
-                    return systemSpeechText;
-                }
-
-                // Priority 3: Graceful Audio Analysis Fallback (Duration and Speech Activity)
-                return AnalyzeAudioActivity(wavPath);
+                return string.Empty;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                return $"[Audio segment captured: {Path.GetFileName(wavPath)} ({ex.Message})]";
+                return string.Empty;
             }
         }
 
-        private static string AnalyzeAudioActivity(string wavPath)
+        public static string CleanTranscript(string raw)
         {
-            try
+            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+            var lines = raw.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            var cleanTokens = new System.Collections.Generic.List<string>();
+            string lastToken = null;
+            foreach (var line in lines)
             {
-                var fileInfo = new FileInfo(wavPath);
-                if (fileInfo.Length <= 44)
+                var trimmed = line.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
+
+                // Strip hallucinated bracket cues like [BLANK_AUDIO], (speaking in foreign language), (laughter), etc.
+                if (trimmed.StartsWith("[") && trimmed.EndsWith("]")) continue;
+                if (trimmed.StartsWith("(") && trimmed.EndsWith(")")) continue;
+                if (trimmed.IndexOf("[BLANK_AUDIO]", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (trimmed.IndexOf("(speaking in foreign language)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (trimmed.IndexOf("(laughter)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (trimmed.IndexOf("(laughing)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (trimmed.IndexOf("(music)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (trimmed.IndexOf("(applause)", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+                if (trimmed.StartsWith("- ")) trimmed = trimmed.Substring(2).Trim();
+                if (trimmed == "-") continue;
+
+                // Strip single isolated filler tokens
+                if (trimmed.Equals("you", StringComparison.OrdinalIgnoreCase) ||
+                    trimmed.Equals("I", StringComparison.OrdinalIgnoreCase))
                 {
-                    return "[Silent audio segment]";
+                    continue;
                 }
 
-                // 16kHz 16-bit mono PCM = 32,000 bytes per second
-                long pcmBytes = fileInfo.Length - 44;
-                double seconds = (double)pcmBytes / 32000.0;
-
-                // Read sample bytes to calculate RMS energy
-                using (var fs = File.OpenRead(wavPath))
+                // Ensure there are real alphabetic characters
+                int letterCount = 0;
+                foreach (char c in trimmed)
                 {
-                    fs.Seek(44, SeekOrigin.Begin);
-                    var buf = new byte[Math.Min(fs.Length - 44, 32000)]; // sample 1 sec
-                    int read = fs.Read(buf, 0, buf.Length);
-
-                    long sumSquares = 0;
-                    int samples = read / 2;
-                    for (int i = 0; i < samples; i++)
-                    {
-                        short val = BitConverter.ToInt16(buf, i * 2);
-                        sumSquares += (long)val * val;
-                    }
-
-                    double rms = samples > 0 ? Math.Sqrt((double)sumSquares / samples) : 0;
-                    double energyPct = Math.Min(100, (rms / 32768.0) * 100);
-
-                    if (energyPct > 0.5)
-                    {
-                        return $"[Spoken audio activity detected: {seconds:F1}s duration, energy level: {energyPct:F1}%]";
-                    }
-                    else
-                    {
-                        return $"[Background / ambient audio: {seconds:F1}s duration]";
-                    }
+                    if (char.IsLetter(c)) letterCount++;
                 }
-            }
-            catch
-            {
-                return $"[Audio segment: {Path.GetFileName(wavPath)}]";
-            }
-        }
+                if (letterCount < 3) continue;
 
-        private static string TranscribeWithSystemSpeech(string wavPath)
-        {
-            try
-            {
-                var sb = new System.Text.StringBuilder();
-                using (var engine = new System.Speech.Recognition.SpeechRecognitionEngine(new System.Globalization.CultureInfo("en-US")))
+                // Deduplicate immediate repetition loops
+                if (string.Equals(lastToken, trimmed, StringComparison.OrdinalIgnoreCase))
                 {
-                    engine.LoadGrammar(new System.Speech.Recognition.DictationGrammar());
-                    engine.SpeechRecognized += (s, e) =>
-                    {
-                        if (e.Result != null && !string.IsNullOrWhiteSpace(e.Result.Text))
-                        {
-                            sb.Append(e.Result.Text).Append(" ");
-                        }
-                    };
-
-                    using (var stream = File.OpenRead(wavPath))
-                    {
-                        engine.SetInputToWaveStream(stream);
-                        while (true)
-                        {
-                            var res = engine.Recognize(TimeSpan.FromSeconds(2));
-                            if (res == null) break;
-                        }
-                    }
+                    continue;
                 }
 
-                string result = sb.ToString().Trim();
-                return string.IsNullOrWhiteSpace(result) ? null : result;
+                lastToken = trimmed;
+                cleanTokens.Add(trimmed);
             }
-            catch
-            {
-                return null;
-            }
+            return string.Join(" ", cleanTokens).Trim();
         }
 
         /// <summary>

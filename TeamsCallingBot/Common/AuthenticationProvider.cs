@@ -154,18 +154,18 @@ namespace TeamsCallingBot.Common
         {
             const string schema = "Bearer";
 
-            if (!string.IsNullOrWhiteSpace(this.overrideBearerToken))
-            {
-                this.GraphLogger.Warn("AuthenticationProvider: using OverrideBearerToken bypass - MSAL not called. Temporary, see class comment.");
-                request.Headers.Authorization = new AuthenticationHeaderValue(schema, this.overrideBearerToken);
-                return;
-            }
-
-            // 1. Try direct HTTP client-credentials acquisition (proven reliable, avoids MSAL authority quirks)
+            // 1. Try direct HTTP client-credentials acquisition (proven reliable, auto-refreshes seamlessly)
             string directToken = await this.AcquireTokenDirectAsync(tenant).ConfigureAwait(false);
             if (!string.IsNullOrWhiteSpace(directToken))
             {
                 request.Headers.Authorization = new AuthenticationHeaderValue(schema, directToken);
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(this.overrideBearerToken))
+            {
+                this.GraphLogger.Warn("AuthenticationProvider: using OverrideBearerToken fallback.");
+                request.Headers.Authorization = new AuthenticationHeaderValue(schema, this.overrideBearerToken);
                 return;
             }
 

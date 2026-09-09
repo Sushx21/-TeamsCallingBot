@@ -425,7 +425,20 @@ namespace TeamsCallingBot.Video
                 }
 
                 writer.Close();
-                this.log($"[VideoRecorder] Segment closed: {writer.Path} ({writer.RealFrameCount} frames, {writer.FrameCount} slots, {writer.FileLength / 1024 / 1024} MB)");
+                var closedAvi = writer.Path;
+                this.log($"[VideoRecorder] Segment closed: {closedAvi} ({writer.RealFrameCount} frames, {writer.FrameCount} slots, {writer.FileLength / 1024 / 1024} MB)");
+
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await ConvertSegmentsToMp4Async(new[] { closedAvi }, null, this.log).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        this.log($"[VideoRecorder] Async MP4 conversion error: {ex.Message}");
+                    }
+                });
             }
             catch (Exception ex)
             {
@@ -501,6 +514,11 @@ namespace TeamsCallingBot.Video
                 }
 
                 string mp4 = Path.ChangeExtension(avi, ".mp4");
+                if (File.Exists(mp4))
+                {
+                    result.Add(mp4);
+                    continue;
+                }
                 try
                 {
                     var psi = new ProcessStartInfo

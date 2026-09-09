@@ -1,21 +1,25 @@
 namespace TeamsCallingBot.Http
 {
     using System;
+    using System.Collections.Generic;
+    using System.Linq;
     using System.Threading.Tasks;
     using Microsoft.AspNetCore.Mvc;
     using TeamsCallingBot.Bot;
 
     /// <summary>
-    /// Manual trigger for testing: POST a meeting join URL here and the bot joins it.
-    /// Real triggering (Cloud Run deciding when to join, per the architecture doc) is a separate,
-    /// later integration - this exists purely so the VM side can be smoke-tested on its own first.
-    ///
-    /// CONCURRENT MEETINGS: POST here once PER meeting, each with that meeting's long-format
-    /// join URL (Graph event.onlineMeeting.joinUrl - the .../19:meeting_...@thread.v2/0?context={tid,oid}
-    /// form). Each call runs independently up to BotOptions.MaxConcurrentCalls; the response carries
-    /// that meeting's own callId, which you then use with the management endpoints.
+    /// Trigger for meeting joins: POST one or multiple meeting join URLs here and the bot joins them concurrently.
+    /// Supports:
+    /// 1. Single meeting join URL: { "MeetingJoinUrl": "..." }
+    /// 2. Multiple meeting URLs in array: { "MeetingJoinUrls": ["url1", "url2", "url3"] }
+    /// 3. Semicolon/newline separated URLs in "MeetingJoinUrl".
+    /// 
+    /// Each call runs independently up to BotOptions.MaxConcurrentCalls (default 10).
     /// </summary>
     [Route("api/testjoin")]
+    [Route("api/join")]
+    [Route("api/calling/join")]
+    [Route("api/calls/join")]
     public class JoinCallController : Controller
     {
         private readonly TeamsCallingBot.Bot.Bot bot;
@@ -28,35 +32,104 @@ namespace TeamsCallingBot.Http
         [HttpPost]
         public async Task<IActionResult> JoinAsync([FromBody] JoinCallRequest request)
         {
-            if (request == null || string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
+            if (request == null)
             {
-                return this.BadRequest(new { error = "MeetingJoinUrl is required." });
+                return this.BadRequest(new { error = "Request body is required." });
             }
 
-            try
+            var urls = new List<string>();
+
+            if (request.MeetingJoinUrls != null && request.MeetingJoinUrls.Count > 0)
             {
-                var call = await this.bot.JoinCallAsync(request.MeetingJoinUrl).ConfigureAwait(false);
-                return this.Ok(new { callId = call.Id, note = "Call CREATED. It is only truly joined once its state reaches Established - check the logs." });
+                urls.AddRange(request.MeetingJoinUrls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim()));
             }
-            catch (ArgumentException ex)
+
+            if (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
             {
-                // Bad / unparseable join URL (e.g. short link + passcode). 400 with the actionable reason.
-                return this.BadRequest(new { error = ex.Message });
+                var split = request.MeetingJoinUrl
+                    .Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(u => u.Trim())
+                    .Where(u => !string.IsNullOrWhiteSpace(u));
+                urls.AddRange(split);
             }
-            catch (InvalidOperationException ex)
+
+            urls = urls.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            if (urls.Count == 0)
             {
-                // Concurrency cap reached (see BotOptions.MaxConcurrentCalls). 429 = try again later.
-                return this.StatusCode(429, new { error = ex.Message });
+                return this.BadRequest(new { error = "At least one MeetingJoinUrl or MeetingJoinUrls entry is required." });
             }
-            catch (Exception ex)
+
+            // Single URL case (for direct backward compatibility)
+            if (urls.Count == 1)
             {
-                return this.StatusCode(500, new { error = "Join failed unexpectedly.", detail = ex.Message });
+                var singleUrl = urls[0];
+                try
+                {
+                    var call = await this.bot.JoinCallAsync(singleUrl).ConfigureAwait(false);
+                    return this.Ok(new
+                    {
+                        callId = call.Id,
+                        meetingJoinUrl = singleUrl,
+                        status = "CallCreated",
+                        note = "Call CREATED. It is joined once state reaches Established - check logs."
+                    });
+                }
+                catch (ArgumentException ex)
+                {
+                    return this.BadRequest(new { error = ex.Message, meetingJoinUrl = singleUrl });
+                }
+                catch (InvalidOperationException ex)
+                {
+                    return this.StatusCode(429, new { error = ex.Message, meetingJoinUrl = singleUrl });
+                }
+                catch (Exception ex)
+                {
+                    return this.StatusCode(500, new { error = "Join failed unexpectedly.", detail = ex.Message, meetingJoinUrl = singleUrl });
+                }
             }
+
+            // Multiple URLs case (3-4 meetings concurrently)
+            var joinTasks = urls.Select(async url =>
+            {
+                try
+                {
+                    var call = await this.bot.JoinCallAsync(url).ConfigureAwait(false);
+                    return new
+                    {
+                        success = true,
+                        meetingJoinUrl = url,
+                        callId = call.Id,
+                        status = "CallCreated",
+                        error = (string)null
+                    };
+                }
+                catch (Exception ex)
+                {
+                    return new
+                    {
+                        success = false,
+                        meetingJoinUrl = url,
+                        callId = (string)null,
+                        status = "Failed",
+                        error = ex.Message
+                    };
+                }
+            });
+
+            var results = await Task.WhenAll(joinTasks).ConfigureAwait(false);
+            return this.Ok(new
+            {
+                message = $"Processed {results.Length} concurrent join requests.",
+                activeCallsCount = this.bot.CallHandlers.Count,
+                results = results
+            });
         }
     }
 
     public class JoinCallRequest
     {
         public string MeetingJoinUrl { get; set; }
+        public List<string> MeetingJoinUrls { get; set; }
     }
 }
