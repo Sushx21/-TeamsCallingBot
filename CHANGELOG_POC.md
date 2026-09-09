@@ -124,3 +124,27 @@ This file tracks every change made while addressing the three reported issues.
 ## Build
 - `dotnet build TeamsCallingBot.sln` → **0 errors**. 3 warnings, all pre-existing/unrelated
   (unused `isKeyFrameNeeded` field; two obsolete GCS credential APIs in `Storage/GcsUploader.cs`).
+- Full **`dotnet clean` + rebuild** re-verified (2026-09-09): **Build succeeded, 0 Errors, 3 Warnings**.
+
+## Project layout (already feature-organised — not reshuffled, to keep namespaces/build intact)
+```
+TeamsCallingBot.sln
+TeamsCallingBot/
+  Program.cs, Startup.cs            app entry + host wiring
+  Config/    BotOptions.cs          settings model
+  Http/      controllers            /api/testjoin, /api/calling/notification
+  Bot/       Bot.cs, CallHandler.cs join + per-call lifecycle/recording
+  Common/    JoinInfo.cs, auth      join-URL parsing, auth provider
+  Audio/     WhisperTranscriber, AudioAggregator   capture + transcription
+  Video/     VideoRecorder, MjpegAviWriter, ffmpeg AVI->MP4
+  Storage/   RecordingsManager (per-meeting folders), GcsUploader
+  Chat/ Mom/ Tda/                   chat client, MoM generation, TDA helpers
+```
+
+## Runtime prerequisites (compiling != joining — for it to actually WORK)
+1. **Real AAD client secret** in `appsettings.json` (`AadAppSecretOrCertThumbprint`) — the sample had a
+   `TODO-...` placeholder, which is the likely cause of the silent "logged joined but no face card".
+2. **ffmpeg** resolvable (auto-detected) or set `FfmpegPath` — else video stays unplayable `.avi`.
+3. **whisper** at `C:\whisper\whisper-cli.exe` + `ggml-small.bin` for transcription (else fallback).
+4. Long-format `onlineMeeting.joinUrl` (with `?context={tid,oid}`) passed to `/api/testjoin` — not the
+   short meet link + passcode.
