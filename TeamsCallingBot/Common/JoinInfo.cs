@@ -44,17 +44,32 @@ namespace TeamsCallingBot.Common
                 return result;
             }
 
-            if (ShortFormatRegex.IsMatch(WebUtility.UrlDecode(joinURL).Split('?')[0]))
+            var isShort = !string.IsNullOrWhiteSpace(joinURL)
+                && ShortFormatRegex.IsMatch(WebUtility.UrlDecode(joinURL).Split('?')[0]);
+
+            if (isShort)
             {
                 var resolvedUrl = await ResolveShortUrlAsync(joinURL).ConfigureAwait(false);
                 if (TryParseLongFormat(resolvedUrl, out result))
                 {
                     return result;
                 }
+
+                // Short link that did not redirect to a context-bearing long URL - the single most
+                // common real-world failure. Spell out the fix so it's obvious from the exception.
+                throw new ArgumentException(
+                    "Join URL is a SHORT link (teams.microsoft.com/meet/<id>?p=<passcode>) that could not be " +
+                    "resolved to a joinable URL. A short link + passcode cannot be joined by a calling bot: it " +
+                    "carries no threadId / organizer / tenant. Fetch the meeting's Microsoft Graph " +
+                    "event.onlineMeeting.joinUrl (the long 'meetup-join' URL containing '?context={tid,oid}') and " +
+                    $"pass THAT instead. Received: {joinURL}", nameof(joinURL));
             }
 
             throw new ArgumentException(
-                $"Join URL cannot be parsed (long-format and short-link resolution both failed): {joinURL}.", nameof(joinURL));
+                "Join URL could not be parsed. Expected a long 'meetup-join' URL containing a " +
+                "'?context={tid,oid,...}' blob (this is what Graph returns as event.onlineMeeting.joinUrl). " +
+                "The URL provided is neither a recognised long-format link nor a short /meet/ link. " +
+                $"Received: {joinURL}", nameof(joinURL));
         }
 
         /// <summary>

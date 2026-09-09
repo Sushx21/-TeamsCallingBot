@@ -162,18 +162,41 @@ namespace TeamsCallingBot.Audio
         /// <summary>
         /// net472 has no Process.WaitForExitAsync (that's a .NET 5+ extension method) - this is the
         /// manual equivalent via the Exited event, needed to avoid blocking a thread on WaitForExit().
+        ///
+        /// FIX (2026-09-09): the previous version left RedirectStandardOutput/Error true but never
+        /// drained either pipe. whisper.cpp is very chatty on stderr; once the OS pipe buffer (~4 KB)
+        /// filled, the child blocked on write, never exited, and the Exited event never fired - the
+        /// transcription Task hung forever and the whole live-transcript loop stalled. We now
+        /// asynchronously drain both pipes (BeginOutput/ErrorReadLine) so the child can never block,
+        /// and add a hard timeout so a wedged process can't hang a meeting.
         /// </summary>
-        private static Task RunAndWaitAsync(Process process)
+        private static async Task RunAndWaitAsync(Process process)
         {
             var tcs = new System.Threading.Tasks.TaskCompletionSource<bool>();
             process.Exited += (s, e) => tcs.TrySetResult(true);
+
+            // Discard child output, but KEEP READING it so the pipe never fills and blocks the child.
+            process.OutputDataReceived += (s, e) => { };
+            process.ErrorDataReceived += (s, e) => { };
+
             process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
             if (process.HasExited)
             {
                 tcs.TrySetResult(true);
+                return;
             }
 
-            return tcs.Task;
+            // Cap the wait so a hung whisper-cli can't stall the meeting indefinitely.
+            var timeout = Task.Delay(TimeSpan.FromMinutes(10));
+            var completed = await Task.WhenAny(tcs.Task, timeout).ConfigureAwait(false);
+            if (completed == timeout)
+            {
+                try { if (!process.HasExited) process.Kill(); }
+                catch { /* best effort */ }
+            }
         }
     }
 }

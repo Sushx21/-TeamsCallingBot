@@ -76,8 +76,12 @@ namespace TeamsCallingBot.Config
         /// <summary>Record each participant's screen share (VBSS) to a per-person video file.</summary>
         public bool RecordScreenShare { get; set; } = true;
 
-        /// <summary>Record the subscribed participant camera stream to a per-person video file.</summary>
-        public bool RecordParticipantVideo { get; set; } = true;
+        /// <summary>
+        /// Record the subscribed participant camera stream to a per-person video file.
+        /// Default OFF: this build focuses on screen-share recording only (per product decision
+        /// 2026-09-09). Set true to also capture the single subscribed camera feed.
+        /// </summary>
+        public bool RecordParticipantVideo { get; set; } = false;
 
         /// <summary>
         /// Target frames per second written to the screen-share video file. Teams delivers screen
@@ -103,8 +107,11 @@ namespace TeamsCallingBot.Config
         public long MaxVideoSegmentBytes { get; set; } = 1_500_000_000;
 
         /// <summary>
-        /// Optional full path to ffmpeg.exe. When set and present, every finished AVI segment is
-        /// re-encoded to H.264 MP4 at call end (the AVI is kept). Leave blank to skip.
+        /// Optional full path to ffmpeg.exe used to re-encode finished MJPEG AVI segments to H.264 MP4
+        /// at call end (the AVI is kept). Leave blank to AUTO-DETECT: the bot will look for ffmpeg on
+        /// the system PATH and in a few common install locations. MP4 is important because the raw
+        /// MJPEG .avi files do NOT play in the default Windows 11 players (which is why recordings
+        /// looked like "only screenshots") - the .mp4 plays everywhere. See VideoRecorder.ResolveFfmpegPath.
         /// </summary>
         public string FfmpegPath { get; set; } = string.Empty;
 

@@ -5,6 +5,7 @@ namespace TeamsCallingBot.Bot
     using System.Collections.Generic;
     using System.Threading;
     using System.Threading.Tasks;
+    using Microsoft.Graph;
     using Microsoft.Graph.Communications.Calls;
     using Microsoft.Graph.Communications.Calls.Media;
     using Microsoft.Graph.Communications.Client;
@@ -145,7 +146,29 @@ namespace TeamsCallingBot.Bot
 
             try
             {
-                var (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
+                ChatInfo chatInfo;
+                MeetingInfo meetingInfo;
+                string tenantId;
+                try
+                {
+                    (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
+                }
+                catch (Exception parseEx)
+                {
+                    // A parse failure here means we never even attempt to join - make that explicit
+                    // rather than letting it look like a generic join error later.
+                    this.graphLogger.Error(parseEx, $"[Join] Could not parse the join URL - NOT attempting to join. URL: {meetingJoinUrl}");
+                    throw;
+                }
+
+                // Log exactly what coordinates we derived. Missing organizer/tenant is the usual reason
+                // a "successful" join never produces a face card, so surface it up front.
+                var organizerId = (meetingInfo as OrganizerMeetingInfo)?.Organizer?.User?.Id;
+                this.graphLogger.Info(
+                    $"[Join] Parsed join coordinates: threadId={(string.IsNullOrEmpty(chatInfo?.ThreadId) ? "(MISSING)" : chatInfo.ThreadId)}, " +
+                    $"organizerOid={(string.IsNullOrEmpty(organizerId) ? "(MISSING)" : organizerId)}, " +
+                    $"tenantId={(string.IsNullOrEmpty(tenantId) ? "(MISSING)" : tenantId)}. " +
+                    "Any (MISSING) value here means the join will likely fail silently (no face card).");
 
                 var mediaSession = this.CreateMediaSession();
 
@@ -183,7 +206,10 @@ namespace TeamsCallingBot.Bot
 
                 this.CallHandlers[call.Id] = handler;
 
-                this.graphLogger.Info($"Join call requested: {call.Id} ({this.CallHandlers.Count} active calls now).");
+                // NOTE: this only means the call was CREATED with Graph, NOT that the bot has joined.
+                // Actual join success is when CallHandler logs CallState.Established; if it doesn't
+                // within ~45s the join watchdog will warn. Do not treat this line as "joined".
+                this.graphLogger.Info($"[Join] Call CREATED (not yet joined): {call.Id} ({this.CallHandlers.Count} active calls now). Waiting for CallState.Established...");
                 return call;
             }
             catch

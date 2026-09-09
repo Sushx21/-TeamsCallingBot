@@ -29,10 +29,17 @@ namespace TeamsCallingBot.Audio
         private const short BitsPerSample = 16;
         private const short Channels = 1;
 
+        private const int BytesPerSecond = SampleRate * Channels * (BitsPerSample / 8); // 32000
+
         private readonly object bufferLock = new object();
         private readonly Dictionary<uint, MemoryStream> buffersBySpeaker = new Dictionary<uint, MemoryStream>();
         private readonly Dictionary<uint, DateTime> firstSeenAtBySpeaker = new Dictionary<uint, DateTime>();
         private readonly MemoryStream mixedBuffer = new MemoryStream();
+
+        // How many bytes of each speaker's buffer have already been handed to the live transcriber.
+        // Lets the live path transcribe only the NEW audio each cycle instead of re-running whisper
+        // over the whole meeting-so-far (which was O(n^2) and produced duplicate/one-timestamp lines).
+        private readonly Dictionary<uint, long> liveTranscribedBytesBySpeaker = new Dictionary<uint, long>();
 
         public void Append(uint speakerId, IntPtr data, long length, long timestamp)
         {
@@ -109,6 +116,69 @@ namespace TeamsCallingBot.Audio
             {
                 var mixedPath = Path.Combine(targetDir, "02_audio_meeting_both_ways.wav");
                 WriteWavFile(mixedPath, mixedPcm);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Returns, per speaker, ONLY the audio captured since the last call to this method, written to
+        /// a small reusable "live chunk" WAV for the live transcriber. Cheap (one whisper run per short
+        /// chunk instead of over the whole meeting) and each returned <see cref="SpeakerAudio.FirstSeenAt"/>
+        /// is the real wall-clock start time of that chunk, so live transcript lines get correct
+        /// timestamps instead of all sharing the speaker's first-seen time.
+        ///
+        /// A chunk is only emitted once it holds at least <paramref name="minChunkSeconds"/> of new
+        /// audio, so we don't fire whisper on tiny slivers. Does NOT clear the main buffers - the
+        /// cumulative per-speaker recording WAVs are still produced by SnapshotToWavFiles/FlushToWavFiles.
+        /// </summary>
+        public List<SpeakerAudio> SnapshotNewAudioForTranscription(string outputDirectory, double minChunkSeconds = 1.0)
+        {
+            var targetDir = string.IsNullOrWhiteSpace(outputDirectory) ? Path.GetTempPath() : outputDirectory;
+            Directory.CreateDirectory(targetDir);
+
+            var chunks = new List<(uint SpeakerId, byte[] Pcm, DateTime ChunkStart)>();
+            long minBytes = (long)(minChunkSeconds * BytesPerSecond);
+
+            lock (this.bufferLock)
+            {
+                foreach (var kvp in this.buffersBySpeaker)
+                {
+                    var speakerId = kvp.Key;
+                    long total = kvp.Value.Length;
+                    this.liveTranscribedBytesBySpeaker.TryGetValue(speakerId, out long consumed);
+
+                    long newBytes = total - consumed;
+                    if (newBytes < minBytes)
+                    {
+                        continue; // wait for more audio before transcribing this speaker again
+                    }
+
+                    var all = kvp.Value.ToArray();
+                    var slice = new byte[newBytes];
+                    Array.Copy(all, consumed, slice, 0, newBytes);
+
+                    var firstSeen = this.firstSeenAtBySpeaker.TryGetValue(speakerId, out var fs) ? fs : DateTime.Now;
+                    var chunkStart = firstSeen.AddSeconds((double)consumed / BytesPerSecond);
+
+                    chunks.Add((speakerId, slice, chunkStart));
+                    this.liveTranscribedBytesBySpeaker[speakerId] = total;
+                }
+            }
+
+            var result = new List<SpeakerAudio>();
+            foreach (var chunk in chunks)
+            {
+                var speakerName = chunk.SpeakerId == UnknownSpeakerId ? "speaker_unknown" : $"speaker_{chunk.SpeakerId}";
+                var path = Path.Combine(targetDir, $"live_chunk_{speakerName}.wav");
+                WriteWavFile(path, chunk.Pcm);
+                result.Add(new SpeakerAudio
+                {
+                    SpeakerId = chunk.SpeakerId,
+                    WavPath = path,
+                    FirstSeenAt = chunk.ChunkStart,
+                    TotalDurationSeconds = chunk.Pcm.Length / (double)BytesPerSecond,
+                });
             }
 
             return result;

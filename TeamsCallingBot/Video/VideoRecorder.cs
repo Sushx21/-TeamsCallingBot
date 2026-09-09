@@ -481,10 +481,17 @@ namespace TeamsCallingBot.Video
         public static async Task<List<string>> ConvertSegmentsToMp4Async(IEnumerable<string> aviPaths, string ffmpegPath, Action<string> log)
         {
             var result = new List<string>();
-            if (string.IsNullOrWhiteSpace(ffmpegPath) || !File.Exists(ffmpegPath))
+
+            // Auto-detect ffmpeg when no explicit, valid path was configured.
+            var resolved = ResolveFfmpegPath(ffmpegPath);
+            if (string.IsNullOrWhiteSpace(resolved))
             {
+                log?.Invoke("[VideoRecorder] ffmpeg not found (configure BotOptions.FfmpegPath or add ffmpeg to PATH). " +
+                            "Leaving MJPEG .avi segments un-converted - note these may not play in the default Windows player; open them in VLC or install ffmpeg for .mp4.");
                 return result;
             }
+
+            ffmpegPath = resolved;
 
             foreach (var avi in aviPaths)
             {
@@ -530,6 +537,77 @@ namespace TeamsCallingBot.Video
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Resolves an ffmpeg executable. Priority: (1) the explicitly configured path if it exists;
+        /// (2) any "ffmpeg"/"ffmpeg.exe" found on the PATH environment variable; (3) a few common
+        /// Windows install locations. Returns null if none is found.
+        /// </summary>
+        public static string ResolveFfmpegPath(string configuredPath)
+        {
+            if (!string.IsNullOrWhiteSpace(configuredPath) && File.Exists(configuredPath))
+            {
+                return configuredPath;
+            }
+
+            var exeNames = new[] { "ffmpeg.exe", "ffmpeg" };
+
+            // (2) Search PATH.
+            var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            foreach (var dir in pathEnv.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(dir))
+                {
+                    continue;
+                }
+
+                foreach (var exe in exeNames)
+                {
+                    try
+                    {
+                        var candidate = Path.Combine(dir.Trim(), exe);
+                        if (File.Exists(candidate))
+                        {
+                            return candidate;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore malformed PATH entries.
+                    }
+                }
+            }
+
+            // (3) Common install locations.
+            var commonDirs = new[]
+            {
+                @"C:\ffmpeg\bin",
+                @"C:\Program Files\ffmpeg\bin",
+                @"C:\ProgramData\chocolatey\bin",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WinGet\Links"),
+            };
+
+            foreach (var dir in commonDirs)
+            {
+                foreach (var exe in exeNames)
+                {
+                    try
+                    {
+                        var candidate = Path.Combine(dir, exe);
+                        if (File.Exists(candidate))
+                        {
+                            return candidate;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore.
+                    }
+                }
+            }
+
+            return null;
         }
 
         public static string SanitizeFileName(string name)

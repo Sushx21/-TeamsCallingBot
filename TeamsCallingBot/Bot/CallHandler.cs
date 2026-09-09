@@ -63,6 +63,13 @@ namespace TeamsCallingBot.Bot
         private int joinWelcomeSent = 0;
         private volatile bool callEstablished = false;
 
+        // Join diagnostics: watchdog that fires if the call is created but never actually reaches
+        // Established (the "logs say joined but no blue face card" case), and last-seen state for
+        // clear transition logging.
+        private CancellationTokenSource joinWatchdogCts;
+        private volatile string lastLoggedCallState;
+        private const int JoinWatchdogSeconds = 45;
+
         // Options
         private readonly BotOptions options;
 
@@ -146,6 +153,12 @@ namespace TeamsCallingBot.Bot
             this.Call.OnUpdated += this.OnCallUpdated;
             this.Call.Participants.OnUpdated += this.OnParticipantsUpdated;
 
+            // 2b. Join watchdog - the SDK's AddAsync/answer succeeding only means the call was CREATED,
+            // NOT that the bot actually joined and is visible. If we never reach CallState.Established
+            // within the timeout, log a loud, actionable warning so a silent join failure (no face card)
+            // is visible in the logs instead of looking like a successful join.
+            this.StartJoinWatchdog();
+
             // 3. Resolve Media Sockets
             var localMediaSession = this.Call.GetLocalMediaSession();
             if (localMediaSession != null)
@@ -212,8 +225,11 @@ namespace TeamsCallingBot.Bot
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(10), flushToken).ConfigureAwait(false);
-                        var snapshotAudios = this.AudioAggregator.SnapshotToWavFiles(this.RecordingsManager.SessionDirectory);
-                        await this.UpdateLiveTranscriptsAsync(snapshotAudios).ConfigureAwait(false);
+                        // Keep the cumulative per-speaker recording WAVs fresh on disk...
+                        this.AudioAggregator.SnapshotToWavFiles(this.RecordingsManager.SessionDirectory);
+                        // ...but transcribe ONLY the new audio since last cycle (incremental, correct timestamps).
+                        var newAudio = this.AudioAggregator.SnapshotNewAudioForTranscription(this.RecordingsManager.SessionDirectory);
+                        await this.UpdateLiveTranscriptsAsync(newAudio).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) { }
                     catch (Exception ex)
@@ -834,39 +850,61 @@ namespace TeamsCallingBot.Bot
         // ===================================================================
         // 4. Live Transcripts & Periodic Updates
         // ===================================================================
-        private async Task UpdateLiveTranscriptsAsync(IReadOnlyList<SpeakerAudio> snapshotAudios)
+        /// <summary>
+        /// Transcribes each NEW audio chunk (see AudioAggregator.SnapshotNewAudioForTranscription) and
+        /// APPENDS the result to the persistent liveTranscriptEntries list, then saves. Because chunks
+        /// are incremental, whisper only ever runs on the newly-arrived audio - no more re-transcribing
+        /// the whole meeting every cycle, and each line keeps the chunk's real timestamp.
+        /// </summary>
+        private async Task UpdateLiveTranscriptsAsync(IReadOnlyList<SpeakerAudio> newAudioChunks)
         {
-            var combinedEntries = new List<TranscriptEntry>();
-            lock (this.liveTranscriptLock)
+            if (newAudioChunks == null || newAudioChunks.Count == 0)
             {
-                combinedEntries.AddRange(this.liveTranscriptEntries);
+                return;
             }
 
-            if (snapshotAudios != null && snapshotAudios.Count > 0)
+            bool added = false;
+            foreach (var audio in newAudioChunks)
             {
-                foreach (var audio in snapshotAudios)
+                string text;
+                try
                 {
-                    try
+                    text = await WhisperTranscriber.TranscribeAsync(audio.WavPath).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Surface the failure instead of silently degrading to nothing.
+                    this.graphLogger.Warn($"[LiveTranscript] Transcription failed for {Path.GetFileName(audio.WavPath)}: {ex.Message}");
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                var name = this.ResolveSpeakerName(audio.SpeakerId);
+                lock (this.liveTranscriptLock)
+                {
+                    this.liveTranscriptEntries.Add(new TranscriptEntry
                     {
-                        var text = await WhisperTranscriber.TranscribeAsync(audio.WavPath).ConfigureAwait(false);
-                        if (!string.IsNullOrWhiteSpace(text))
-                        {
-                            var name = this.ResolveSpeakerName(audio.SpeakerId);
-                            combinedEntries.Add(new TranscriptEntry
-                            {
-                                Timestamp = audio.FirstSeenAt.ToString("yyyy-MM-dd HH:mm:ss"),
-                                Speaker = name,
-                                Transcript = text.Trim()
-                            });
-                        }
-                    }
-                    catch { }
+                        Timestamp = audio.FirstSeenAt.ToString("yyyy-MM-dd HH:mm:ss"),
+                        Speaker = name,
+                        Transcript = text.Trim()
+                    });
+                    added = true;
                 }
             }
 
-            if (combinedEntries.Count > 0)
+            if (added)
             {
-                this.RecordingsManager.SaveTranscripts(combinedEntries);
+                List<TranscriptEntry> snapshot;
+                lock (this.liveTranscriptLock)
+                {
+                    snapshot = new List<TranscriptEntry>(this.liveTranscriptEntries);
+                }
+
+                this.RecordingsManager.SaveTranscripts(snapshot);
             }
         }
 
@@ -1250,17 +1288,91 @@ namespace TeamsCallingBot.Bot
         // ===================================================================
         // 7. Call State, Removal Detection & Chat Message Posting
         // ===================================================================
+        /// <summary>
+        /// Starts a one-shot watchdog: if the call has not reached Established within
+        /// <see cref="JoinWatchdogSeconds"/>, logs a loud, actionable warning. This catches the exact
+        /// failure the team hit - the join API "succeeds" and logs look like a join, but the bot never
+        /// actually enters the meeting (no blue face card), usually because it is stuck in the lobby,
+        /// the join coordinates (thread/organizer/tenant) were wrong, or media never negotiated.
+        /// </summary>
+        private void StartJoinWatchdog()
+        {
+            this.joinWatchdogCts = new CancellationTokenSource();
+            var token = this.joinWatchdogCts.Token;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(JoinWatchdogSeconds), token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return; // established (or torn down) in time - nothing to warn about
+                }
+
+                if (this.callEstablished || token.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                var lastState = this.lastLoggedCallState ?? "(no state update ever received)";
+                var warning =
+                    $"[Call {this.Call.Id}] JOIN WATCHDOG: call was created but did NOT reach 'Established' within " +
+                    $"{JoinWatchdogSeconds}s (last state: {lastState}). The bot is very likely NOT actually in the " +
+                    "meeting despite the join call returning success - no participant/face card will be visible. " +
+                    "Common causes: (1) waiting in the meeting lobby and not admitted; (2) bad join coordinates " +
+                    "(threadId / organizer oid / tenantId) - e.g. a short link or a join URL missing the " +
+                    "?context={tid,oid} blob; (3) media/ICE never negotiated. Check the state transitions and any " +
+                    "resultInfo codes above.";
+                this.graphLogger.Warn(warning);
+                Console.WriteLine(">>> " + warning);
+                try { this.Timeline.AddEvent("join_watchdog_timeout", lastState); } catch { }
+            }, token);
+        }
+
+        private void CancelJoinWatchdog()
+        {
+            try
+            {
+                this.joinWatchdogCts?.Cancel();
+                this.joinWatchdogCts?.Dispose();
+                this.joinWatchdogCts = null;
+            }
+            catch { }
+        }
+
         private void OnCallUpdated(ICall sender, ResourceEventArgs<Call> args)
         {
-            Console.WriteLine($">>> CALL STATE CHANGED: {args.NewResource.State} (call {this.Call.Id})");
+            var newState = args.NewResource.State.ToString();
             var resultInfo = args.NewResource.ResultInfo;
+
+            // Structured transition log (not just Console) so state changes are visible in the real log
+            // sink and correlated to the call id. This is the trail that tells you whether "joined"
+            // actually reached Established or died in Establishing/Terminated.
+            string transition = $"[Call {this.Call.Id}] State {this.lastLoggedCallState ?? "(new)"} -> {newState}";
             if (resultInfo != null)
             {
-                Console.WriteLine($">>> CALL RESULT INFO: code={resultInfo.Code}, subcode={resultInfo.Subcode}, message={resultInfo.Message}");
+                transition += $" | resultInfo: code={resultInfo.Code}, subcode={resultInfo.Subcode}, message=\"{resultInfo.Message}\"";
+            }
+
+            this.lastLoggedCallState = newState;
+            Console.WriteLine($">>> CALL STATE CHANGED: {newState} (call {this.Call.Id})");
+
+            // A terminated call carrying a non-zero result code is a failure - log it as an error.
+            if (args.NewResource.State == CallState.Terminated && resultInfo != null && resultInfo.Code != 0 && resultInfo.Code != 200)
+            {
+                this.graphLogger.Error($"{transition}  <-- CALL ENDED WITH A FAILURE CODE. If the bot never showed a face card, this is why.");
+                Console.WriteLine($">>> CALL FAILED: code={resultInfo.Code}, subcode={resultInfo.Subcode}, message={resultInfo.Message}");
+            }
+            else
+            {
+                this.graphLogger.Info(transition);
             }
 
             if (args.NewResource.State == CallState.Established)
             {
+                // We genuinely joined - stop the "never established" watchdog.
+                this.CancelJoinWatchdog();
                 this.callEstablished = true;
                 if (Interlocked.Exchange(ref this.joinWelcomeSent, 1) == 0)
                 {
@@ -1283,6 +1395,9 @@ namespace TeamsCallingBot.Bot
             {
                 return;
             }
+
+            // Call ended - the watchdog is moot now (whether we ever joined or not).
+            this.CancelJoinWatchdog();
 
             if (Interlocked.Exchange(ref this.endHandled, 1) == 1)
             {
@@ -1615,34 +1730,30 @@ namespace TeamsCallingBot.Bot
             this.StopCameraRecorder("call ended");
             this.Timeline.EndedAt = DateTime.Now;
 
-            // 1. Flush Audio to the session folder
+            // 1. Transcribe the final audio TAIL (whatever arrived since the last live cycle and was
+            //    below the min-chunk threshold). Grab it BEFORE FlushToWavFiles clears the buffers.
+            //    The bulk of the transcript is already in liveTranscriptEntries from the live path -
+            //    we no longer re-transcribe the whole meeting here (that duplicated every line and ran
+            //    one huge whisper pass at shutdown).
+            try
+            {
+                var tail = this.AudioAggregator.SnapshotNewAudioForTranscription(this.RecordingsManager.SessionDirectory, minChunkSeconds: 0.0);
+                await this.UpdateLiveTranscriptsAsync(tail).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[Transcript] Final tail transcription failed: {ex.Message}");
+            }
+
+            // 2. Flush audio to the session folder (produces the final per-speaker recording WAVs and
+            //    per-speaker durations used for talk-time below).
             var speakerAudios = this.AudioAggregator.FlushToWavFiles(this.RecordingsManager.SessionDirectory);
 
-            // 2. Transcribe
+            // The complete transcript now lives in liveTranscriptEntries (live increments + final tail).
             var entries = new List<TranscriptEntry>();
             lock (this.liveTranscriptLock)
             {
                 entries.AddRange(this.liveTranscriptEntries);
-            }
-
-            if (speakerAudios.Count > 0)
-            {
-                foreach (var speakerAudio in speakerAudios)
-                {
-                    var speakerName = this.ResolveSpeakerName(speakerAudio.SpeakerId);
-                    var text = await WhisperTranscriber.TranscribeAsync(speakerAudio.WavPath).ConfigureAwait(false);
-                    if (string.IsNullOrWhiteSpace(text))
-                    {
-                        continue;
-                    }
-
-                    entries.Add(new TranscriptEntry
-                    {
-                        Timestamp = speakerAudio.FirstSeenAt.ToString("yyyy-MM-dd HH:mm:ss"),
-                        Speaker = speakerName,
-                        Transcript = text.Trim(),
-                    });
-                }
             }
 
             // 3. Save Transcripts (.txt and .json)
@@ -1651,20 +1762,19 @@ namespace TeamsCallingBot.Bot
                 this.RecordingsManager.SaveTranscripts(entries);
             }
 
-            // 4. Optional MP4 conversion of the recorded video segments
+            // 4. MP4 conversion of the recorded screen-share segments. Always attempt it: when
+            //    FfmpegPath is blank, ConvertSegmentsToMp4Async auto-detects ffmpeg on PATH / common
+            //    locations and logs clearly if it can't be found (leaving the .avi in place).
             var allVideoSessions = this.Timeline.ScreenShareSessions.Concat(this.Timeline.CameraSessions).ToList();
-            if (!string.IsNullOrWhiteSpace(this.options.FfmpegPath))
+            foreach (var session in allVideoSessions)
             {
-                foreach (var session in allVideoSessions)
+                try
                 {
-                    try
-                    {
-                        session.Mp4Files = await VideoRecorder.ConvertSegmentsToMp4Async(session.VideoFiles, this.options.FfmpegPath, this.RecordingsManager.Log).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        this.graphLogger.Warn($"[Video] MP4 conversion failed: {ex.Message}");
-                    }
+                    session.Mp4Files = await VideoRecorder.ConvertSegmentsToMp4Async(session.VideoFiles, this.options.FfmpegPath, this.RecordingsManager.Log).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Warn($"[Video] MP4 conversion failed: {ex.Message}");
                 }
             }
 
@@ -1842,6 +1952,7 @@ namespace TeamsCallingBot.Bot
                 }
             }
 
+            this.CancelJoinWatchdog();
             this.videoBroadcastCts?.Cancel();
             this.periodicFlushCts?.Cancel();
             this.autoLeaveCts?.Cancel();
