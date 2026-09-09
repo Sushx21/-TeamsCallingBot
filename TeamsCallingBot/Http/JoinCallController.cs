@@ -125,11 +125,54 @@ namespace TeamsCallingBot.Http
                 results = results
             });
         }
+
+        /// <summary>
+        /// Production endpoint for forwarded meeting invites (e.g. forwarded to tsl-ai mailbox).
+        /// Accepts raw email body text or HTML, auto-extracts the meeting coordinates, and joins.
+        /// </summary>
+        [HttpPost("invite/forward")]
+        public async Task<IActionResult> ForwardedInviteAsync([FromBody] ForwardedInviteRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.EmailContent))
+            {
+                return this.BadRequest(new { error = "EmailContent is required." });
+            }
+
+            var parsed = Common.EmailMeetingInviteParser.ParseEmailContent(request.EmailContent);
+            if (!parsed.Success || string.IsNullOrWhiteSpace(parsed.JoinUrl))
+            {
+                return this.BadRequest(new { error = parsed.Error ?? "Could not extract meeting URL from email content." });
+            }
+
+            try
+            {
+                var call = await this.bot.JoinCallAsync(parsed.JoinUrl, request.RecordVideo).ConfigureAwait(false);
+                return this.Ok(new
+                {
+                    status = "CallCreated",
+                    callId = call.Id,
+                    meetingJoinUrl = parsed.JoinUrl,
+                    recordVideo = request.RecordVideo,
+                    subject = parsed.Subject
+                });
+            }
+            catch (Exception ex)
+            {
+                return this.StatusCode(500, new { error = ex.Message, joinUrl = parsed.JoinUrl });
+            }
+        }
     }
 
     public class JoinCallRequest
     {
         public string MeetingJoinUrl { get; set; }
         public List<string> MeetingJoinUrls { get; set; }
+        public bool RecordVideo { get; set; } = true;
+    }
+
+    public class ForwardedInviteRequest
+    {
+        public string EmailContent { get; set; }
+        public bool RecordVideo { get; set; } = true;
     }
 }

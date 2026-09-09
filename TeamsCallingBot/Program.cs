@@ -21,64 +21,103 @@ namespace TeamsCallingBot
         {
             var host = BuildWebHost(args);
 
-            // ONE-TIME TEST TRIGGER: paste a real meeting join URL into appsettings.json's
-            // "Bot:TestMeetingJoinUrl" field (see that file - it's the very next line after
-            // CertificateThumbprint) and this fires it automatically 5 seconds after startup,
-            // logging the outcome straight to this console window. No Postman/curl needed.
-            //
-            // EXPECTED RIGHT NOW, before the VM/cert/public IP exist: this will fail - most likely
-            // at Bot construction itself (CertificateThumbprint is still a TODO placeholder, so
-            // MediaPlatform initialization has nothing real to find in the certificate store). That
-            // failure is expected and NOT a bug to chase - it will resolve once appsettings.json's
-            // TODO fields are filled in with the VM's real values.
+            // PERSISTENT AUTO-JOIN & SCHEDULED MEETING ENGINE:
+            // Checks every 15 seconds for:
+            // 1. Initial TestMeetingJoinUrl / TestMeetingJoinUrls
+            // 2. Scheduled meetings in "Bot:ScheduledMeetings" matching current UTC time window
+            // 3. Allows manual chat commands (!join, #joincall) to execute concurrently at any time
             _ = Task.Run(async () =>
             {
                 await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
-
-                var config = host.Services.GetRequiredService<IConfiguration>();
-                var urls = new System.Collections.Generic.List<string>();
-
-                var testUrl = config["Bot:TestMeetingJoinUrl"];
-                if (!string.IsNullOrWhiteSpace(testUrl))
-                {
-                    var split = testUrl.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                                       .Select(u => u.Trim())
-                                       .Where(u => !string.IsNullOrWhiteSpace(u));
-                    urls.AddRange(split);
-                }
-
-                var multiSection = config.GetSection("Bot:TestMeetingJoinUrls").GetChildren();
-                foreach (var child in multiSection)
-                {
-                    if (!string.IsNullOrWhiteSpace(child.Value))
-                    {
-                        urls.Add(child.Value.Trim());
-                    }
-                }
-
-                urls = urls.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
-                if (urls.Count == 0)
-                {
-                    return;
-                }
-
                 var bot = host.Services.GetRequiredService<TeamsCallingBot.Bot.Bot>();
-                foreach (var url in urls)
+                var joinedUrls = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                while (true)
                 {
-                    _ = Task.Run(async () =>
+                    try
                     {
-                        Console.WriteLine($">>> TEST JOIN starting for: {url}");
-                        try
+                        var config = host.Services.GetRequiredService<IConfiguration>();
+                        var urlsToJoin = new System.Collections.Generic.List<string>();
+
+                        var testUrl = config["Bot:TestMeetingJoinUrl"];
+                        if (!string.IsNullOrWhiteSpace(testUrl))
                         {
-                            var call = await bot.JoinCallAsync(url).ConfigureAwait(false);
-                            Console.WriteLine($">>> TEST JOIN accepted. Call id: {call.Id}");
+                            var split = testUrl.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                               .Select(u => u.Trim())
+                                               .Where(u => !string.IsNullOrWhiteSpace(u));
+                            urlsToJoin.AddRange(split);
                         }
-                        catch (Exception ex)
+
+                        var multiSection = config.GetSection("Bot:TestMeetingJoinUrls").GetChildren();
+                        foreach (var child in multiSection)
                         {
-                            Console.WriteLine($">>> TEST JOIN FAILED for {url}: {ex.GetType().Name}: {ex.Message}");
+                            if (!string.IsNullOrWhiteSpace(child.Value))
+                            {
+                                urlsToJoin.Add(child.Value.Trim());
+                            }
                         }
-                    });
+
+                        // Scheduled meetings section: Bot:ScheduledMeetings: [ { MeetingJoinUrl, ScheduledStartTimeUtc } ]
+                        var scheduledSection = config.GetSection("Bot:ScheduledMeetings").GetChildren();
+                        foreach (var item in scheduledSection)
+                        {
+                            var sUrl = item["MeetingJoinUrl"]?.Trim();
+                            var sTimeStr = item["ScheduledStartTimeUtc"]?.Trim();
+
+                            if (!string.IsNullOrWhiteSpace(sUrl))
+                            {
+                                if (DateTime.TryParse(sTimeStr, out var sTimeUtc))
+                                {
+                                    // If within 2 minutes before scheduled start time or up to 60 minutes after
+                                    var diff = DateTime.UtcNow - sTimeUtc.ToUniversalTime();
+                                    if (diff.TotalMinutes >= -2.0 && diff.TotalMinutes <= 60.0)
+                                    {
+                                        if (!joinedUrls.Contains(sUrl))
+                                        {
+                                            Console.WriteLine($">>> [Scheduler] Scheduled meeting trigger matched! Scheduled: {sTimeUtc:u}, Now: {DateTime.UtcNow:u}. Auto-joining: {sUrl}");
+                                            urlsToJoin.Add(sUrl);
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    urlsToJoin.Add(sUrl);
+                                }
+                            }
+                        }
+
+                        urlsToJoin = urlsToJoin.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+                        foreach (var url in urlsToJoin)
+                        {
+                            if (joinedUrls.Contains(url))
+                            {
+                                continue;
+                            }
+
+                            joinedUrls.Add(url);
+                            _ = Task.Run(async () =>
+                            {
+                                Console.WriteLine($">>> AUTO/SCHEDULED JOIN starting for: {url}");
+                                try
+                                {
+                                    var call = await bot.JoinCallAsync(url).ConfigureAwait(false);
+                                    Console.WriteLine($">>> AUTO/SCHEDULED JOIN accepted. Call id: {call.Id}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($">>> AUTO/SCHEDULED JOIN FAILED for {url}: {ex.GetType().Name}: {ex.Message}");
+                                    joinedUrls.Remove(url); // Allow retry
+                                }
+                            });
+                        }
+                    }
+                    catch (Exception loopEx)
+                    {
+                        Console.WriteLine($">>> [Scheduler] Exception in scheduler loop: {loopEx.Message}");
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
                 }
             });
 
