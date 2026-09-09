@@ -141,7 +141,10 @@ namespace TeamsCallingBot.Bot
             this.botAccessToken = accessToken ?? this.options.OverrideBearerToken;
 
             // 1. Initialize Disk Storage & Timeline Manager
-            this.RecordingsManager = new RecordingsManager(this.Call.Id);
+            // Pass the meeting thread id so the output folder is named after it (falls back to the
+            // call id for 1:1 calls with no thread). Lets artifacts be tied to a specific meeting,
+            // which matters when several meetings are recorded concurrently.
+            this.RecordingsManager = new RecordingsManager(this.Call.Id, this.chatThreadId);
             this.AudioAggregator = new AudioAggregator();
             this.Timeline = new MeetingTimeline { CallId = this.Call.Id, ChatThreadId = chatThreadId, StartedAt = this.sessionStartTime };
             this.chatClient = new BotFrameworkChatClient(this.options.AadAppId, this.options.AadAppSecretOrCertThumbprint, this.options.BotFrameworkServiceUrl, this.graphLogger);

@@ -108,6 +108,19 @@ This file tracks every change made while addressing the three reported issues.
   long-format `onlineMeeting.joinUrl`. Each response returns a distinct `callId`; manage each via
   the callId endpoints. Raise `BotOptions.MaxConcurrentCalls` to allow more simultaneously.
 
+### Per-meeting output folders (named by meeting thread id)
+- `Storage/RecordingsManager.cs`: constructor now takes an optional `meetingThreadId`. The output
+  folder is named after the FULL thread id (`19:meeting_...@thread.v2`) instead of a generic
+  `Session_<timestamp>_<callId>`. Added `SanitizeForFolderName()` (replaces `:` and any
+  `Path.GetInvalidFileNameChars()` with `_`, caps length at 130). Falls back to the call/session id
+  when no thread id (1:1 calls). A `_yyyyMMdd_HHmmss` suffix keeps repeat joins of the same meeting
+  in separate folders.
+- `Bot/CallHandler.cs`: passes `this.chatThreadId` into `new RecordingsManager(...)`.
+- Effect: every artifact (audio WAVs, per-speaker WAVs, video segments + MP4, transcript .txt/.json,
+  timeline, metadata) is written under that one per-meeting folder — because everything routes
+  through `RecordingsManager.SessionDirectory`. With N concurrent meetings there are N distinct
+  `CallHandler`s → N `RecordingsManager`s → N thread-id-named folders, each self-contained.
+
 ## Build
 - `dotnet build TeamsCallingBot.sln` → **0 errors**. 3 warnings, all pre-existing/unrelated
   (unused `isKeyFrameNeeded` field; two obsolete GCS credential APIs in `Storage/GcsUploader.cs`).

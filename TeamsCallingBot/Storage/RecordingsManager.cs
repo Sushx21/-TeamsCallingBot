@@ -51,12 +51,18 @@ namespace TeamsCallingBot.Storage
 
         private readonly object fileLock = new object();
 
-        public RecordingsManager(string sessionId)
+        public RecordingsManager(string sessionId, string meetingThreadId = null)
         {
             this.SessionId = string.IsNullOrWhiteSpace(sessionId) ? Guid.NewGuid().ToString() : sessionId;
 
-            var cleanId = this.SessionId.Replace(":", "_").Replace("/", "_").Replace("\\", "_");
-            var folderName = $"Session_{DateTime.Now:yyyyMMdd_HHmmss}_{cleanId}";
+            // Folder name = the FULL meeting thread id (e.g. 19:meeting_xxxx@thread.v2) so every
+            // artifact (audio, video, transcript, MoM) is unambiguously tied to its meeting - critical
+            // once several meetings are recorded concurrently. Falls back to the call/session id when a
+            // thread id is not available (e.g. a direct 1:1 call). A short timestamp suffix keeps
+            // repeated joins of the SAME meeting in separate, non-overwriting folders.
+            var folderLabel = string.IsNullOrWhiteSpace(meetingThreadId) ? this.SessionId : meetingThreadId;
+            var cleanLabel = SanitizeForFolderName(folderLabel);
+            var folderName = $"{cleanLabel}_{DateTime.Now:yyyyMMdd_HHmmss}";
 
             this.SessionDirectory = Path.Combine(BaseRecordingsRoot, folderName);
             Directory.CreateDirectory(this.SessionDirectory);
@@ -238,6 +244,34 @@ namespace TeamsCallingBot.Storage
             var fallback = @"D:\Teamsbot\Recordings";
             Directory.CreateDirectory(fallback);
             return fallback;
+        }
+
+        /// <summary>
+        /// Makes a meeting thread id safe to use as a Windows folder name. The thread id contains ':'
+        /// (e.g. 19:meeting_...@thread.v2) which is illegal in a path segment; that and any other
+        /// invalid characters are replaced with '_'. The full id is otherwise preserved so the meeting
+        /// stays identifiable, with a length cap to stay within path limits.
+        /// </summary>
+        private static string SanitizeForFolderName(string label)
+        {
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                return "unknown";
+            }
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var chars = label.Trim().ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+            {
+                if (Array.IndexOf(invalid, chars[i]) >= 0 || chars[i] == ':')
+                {
+                    chars[i] = '_';
+                }
+            }
+
+            var cleaned = new string(chars);
+            const int maxLen = 130; // keep the whole session path comfortably under the Windows limit
+            return cleaned.Length > maxLen ? cleaned.Substring(0, maxLen) : cleaned;
         }
 
         private static ImageCodecInfo GetEncoder(ImageFormat format)
