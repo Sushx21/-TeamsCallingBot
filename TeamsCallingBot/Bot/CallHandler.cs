@@ -130,6 +130,12 @@ namespace TeamsCallingBot.Bot
 
         public ICall Call { get; }
 
+        /// <summary>
+        /// Per-call override for screen share recording. Defaults to true.
+        /// Can be set to false when a user triggers an audio-only join command (e.g. !join without --video).
+        /// </summary>
+        public bool RecordScreenShareOverride { get; set; } = true;
+
         public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null, string meetingJoinUrl = null)
             : base(TimeSpan.FromMinutes(1), logger)
         {
@@ -587,8 +593,9 @@ namespace TeamsCallingBot.Bot
                     return;
                 }
 
+                bool canRecordVbss = this.options.RecordScreenShare && this.RecordScreenShareOverride;
                 var recorder = this.vbssRecorder;
-                if (recorder != null && this.options.RecordScreenShare)
+                if (recorder != null && canRecordVbss)
                 {
                     if (e.Buffer.MediaSourceId != 0 && recorder.MediaSourceId != 0 && e.Buffer.MediaSourceId != recorder.MediaSourceId
                         && Interlocked.Exchange(ref this.vbssMsiMismatchLogged, 1) == 0)
@@ -600,7 +607,7 @@ namespace TeamsCallingBot.Bot
                     return;
                 }
 
-                if (recorder == null && this.options.RecordScreenShare)
+                if (recorder == null && canRecordVbss)
                 {
                     var who = this.ResolveParticipantByMsi(e.Buffer.MediaSourceId);
                     this.StartVbssRecorder(e.Buffer.MediaSourceId, who.DisplayName, who.ParticipantId);

@@ -93,6 +93,94 @@ namespace TeamsCallingBot.Http
                 return this.Ok();
             }
 
+            // Check for manual join commands (!join, !join --video, #joincall, #joincall #video, /join)
+            bool isJoinCmd = plainText.IndexOf("!join", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             plainText.IndexOf("#joincall", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             plainText.IndexOf("/join", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             plainText.IndexOf("join call", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            bool recordVideo = plainText.IndexOf("--video", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                               plainText.IndexOf("#video", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (isJoinCmd)
+            {
+                Console.WriteLine($">>> [BotMessaging] Detected manual join command from '{fromName}': \"{plainText}\" (video={recordVideo})");
+
+                // 1. Check if an explicit join URL or forwarded invite email was included in the message text
+                var invite = Common.EmailMeetingInviteParser.ParseEmailContent(plainText);
+                string explicitUrl = invite.Success ? invite.JoinUrl : null;
+
+                if (string.IsNullOrWhiteSpace(explicitUrl))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(rawText, @"https?://teams\.microsoft\.com/l/meetup-join/[^\s""'<>]+", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (match.Success)
+                    {
+                        explicitUrl = match.Value;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(explicitUrl))
+                {
+                    Console.WriteLine($">>> [BotMessaging] Joining via explicit URL extracted from chat: {explicitUrl}");
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await this.bot.JoinCallAsync(explicitUrl, recordVideo).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($">>> [BotMessaging] Failed to join via explicit URL: {ex.Message}");
+                        }
+                    });
+
+                    return this.Ok();
+                }
+
+                // 2. AUTO-EXTRACTION FROM TEAMS CHAT CONTEXT:
+                // No link was provided - auto-extract from the Teams conversation activity itself!
+                string meetingThreadId = activity["channelData"]?["meeting"]?["id"]?.ToString();
+                if (string.IsNullOrWhiteSpace(meetingThreadId))
+                {
+                    meetingThreadId = conversationId;
+                }
+
+                string callerAadOid = activity["from"]?["aadObjectId"]?.ToString() ?? fromId;
+                string effectiveTenantId = !string.IsNullOrWhiteSpace(tenantId)
+                    ? tenantId
+                    : (BotOptions.Current?.AadTenantId ?? "f35425af-4755-4e0c-b1bb-b3cb9f1c6afd");
+
+                if (!string.IsNullOrWhiteSpace(meetingThreadId) &&
+                    (meetingThreadId.StartsWith("19:", StringComparison.OrdinalIgnoreCase) ||
+                     meetingThreadId.IndexOf("@thread.v2", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    Console.WriteLine($">>> [BotMessaging] AUTO-EXTRACTED meeting coordinates: threadId={meetingThreadId}, tenant={effectiveTenantId}, caller={callerAadOid}, video={recordVideo}");
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await this.bot.JoinCallByCoordinatesAsync(
+                                meetingThreadId,
+                                effectiveTenantId,
+                                callerAadOid,
+                                recordVideo,
+                                meetingJoinUrl: $"auto-extracted:{meetingThreadId}").ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($">>> [BotMessaging] Auto-join failed: {ex.Message}");
+                        }
+                    });
+
+                    return this.Ok();
+                }
+                else
+                {
+                    Console.WriteLine($">>> [BotMessaging] Command received, but conversationId '{conversationId}' is not a meeting thread (1:1 chat without meeting link).");
+                }
+            }
+
             // Find the relevant CallHandler by matching thread ID.
             // The conversationId in Teams is the channel/meeting thread ID.
             CallHandler matchedHandler = null;

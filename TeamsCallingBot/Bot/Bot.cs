@@ -132,12 +132,67 @@ namespace TeamsCallingBot.Bot
                 mediaSessionId: Guid.NewGuid());
         }
 
-        public async Task<ICall> JoinCallAsync(string meetingJoinUrl)
+        public async Task<ICall> JoinCallAsync(string meetingJoinUrl, bool recordVideo = true)
         {
-            // Fails fast instead of silently overloading the VM past the capacity the architecture
-            // doc itself calls out as the limiting factor for per-speaker capture. This is a real
-            // decision point, not a nicety - past this limit, per-call audio/Whisper throughput
-            // degrades for EVERY call already in progress, not just the new one.
+            if (string.IsNullOrWhiteSpace(meetingJoinUrl))
+            {
+                throw new ArgumentNullException(nameof(meetingJoinUrl));
+            }
+
+            ChatInfo chatInfo;
+            MeetingInfo meetingInfo;
+            string tenantId;
+            try
+            {
+                (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
+            }
+            catch (Exception parseEx)
+            {
+                this.graphLogger.Error(parseEx, $"[Join] Could not parse the join URL - NOT attempting to join. URL: {meetingJoinUrl}");
+                throw;
+            }
+
+            var organizerId = (meetingInfo as OrganizerMeetingInfo)?.Organizer?.User?.Id;
+            return await this.JoinCallByCoordinatesAsync(
+                chatInfo?.ThreadId,
+                tenantId,
+                organizerId,
+                recordVideo,
+                meetingJoinUrl).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Joins a Teams meeting directly by its threadId, tenantId, and organizerOid.
+        /// Used by the in-chat auto-extraction engine (!join, #joincall) where Teams provides
+        /// the exact coordinates in the message activity headers without needing any meeting URL.
+        /// </summary>
+        public async Task<ICall> JoinCallByCoordinatesAsync(
+            string threadId,
+            string tenantId = null,
+            string organizerOid = null,
+            bool recordVideo = true,
+            string meetingJoinUrl = null)
+        {
+            if (string.IsNullOrWhiteSpace(threadId))
+            {
+                throw new ArgumentNullException(nameof(threadId), "ThreadId cannot be null or empty.");
+            }
+
+            // 1. De-duplication check: if the bot is already handling this meeting, don't spin up another call!
+            foreach (var kvp in this.CallHandlers)
+            {
+                string existingThread = kvp.Value.GetEffectiveChatThreadId();
+                if (!string.IsNullOrWhiteSpace(existingThread) &&
+                    string.Equals(existingThread, threadId, StringComparison.OrdinalIgnoreCase))
+                {
+                    this.graphLogger.Info($"[Join] Bot is already in meeting thread '{threadId}'. Updating screen recording to {recordVideo}.");
+                    Console.WriteLine($">>> [Join] Bot already in meeting thread '{threadId}'. Screen recording updated: {recordVideo}");
+                    kvp.Value.RecordScreenShareOverride = recordVideo;
+                    return kvp.Value.Call;
+                }
+            }
+
+            // 2. Concurrency limit check
             if (!this.concurrentCallSlots.Wait(0))
             {
                 throw new InvalidOperationException(
@@ -146,40 +201,46 @@ namespace TeamsCallingBot.Bot
 
             try
             {
-                ChatInfo chatInfo;
-                MeetingInfo meetingInfo;
-                string tenantId;
-                try
-                {
-                    (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
-                }
-                catch (Exception parseEx)
-                {
-                    // A parse failure here means we never even attempt to join - make that explicit
-                    // rather than letting it look like a generic join error later.
-                    this.graphLogger.Error(parseEx, $"[Join] Could not parse the join URL - NOT attempting to join. URL: {meetingJoinUrl}");
-                    throw;
-                }
+                string effectiveTenantId = !string.IsNullOrWhiteSpace(tenantId)
+                    ? tenantId
+                    : (this.options?.AadTenantId ?? "f35425af-4755-4e0c-b1bb-b3cb9f1c6afd");
 
-                // Log exactly what coordinates we derived. Missing organizer/tenant is the usual reason
-                // a "successful" join never produces a face card, so surface it up front.
-                var organizerId = (meetingInfo as OrganizerMeetingInfo)?.Organizer?.User?.Id;
+                string effectiveOrganizerId = !string.IsNullOrWhiteSpace(organizerOid)
+                    ? organizerOid
+                    : (this.options?.AadAppId ?? "9076f721-7295-4f81-9817-4743b7153c2c");
+
                 this.graphLogger.Info(
-                    $"[Join] Parsed join coordinates: threadId={(string.IsNullOrEmpty(chatInfo?.ThreadId) ? "(MISSING)" : chatInfo.ThreadId)}, " +
-                    $"organizerOid={(string.IsNullOrEmpty(organizerId) ? "(MISSING)" : organizerId)}, " +
-                    $"tenantId={(string.IsNullOrEmpty(tenantId) ? "(MISSING)" : tenantId)}. " +
-                    "Any (MISSING) value here means the join will likely fail silently (no face card).");
+                    $"[Join] Direct coordinate join: threadId={threadId}, " +
+                    $"organizerOid={effectiveOrganizerId}, " +
+                    $"tenantId={effectiveTenantId}, recordVideo={recordVideo}.");
+                Console.WriteLine($">>> [Join] Auto-joining meeting via coordinates: threadId={threadId} | video={recordVideo}");
+
+                var chatInfo = new ChatInfo
+                {
+                    ThreadId = threadId,
+                    MessageId = "0",
+                    ReplyChainMessageId = "0"
+                };
+
+                var meetingInfo = new OrganizerMeetingInfo
+                {
+                    Organizer = new IdentitySet
+                    {
+                        User = new Identity
+                        {
+                            Id = effectiveOrganizerId
+                        }
+                    }
+                };
+                meetingInfo.Organizer.User.SetTenantId(effectiveTenantId);
 
                 var mediaSession = this.CreateMediaSession();
-
                 var scenarioId = Guid.NewGuid();
 
-                // Confirmed real constructor - see class-level comment above.
                 var joinParams = new JoinMeetingParameters(chatInfo, meetingInfo, mediaSession)
                 {
-                    // Explicitly request to bypass lobby so bot is immediately admitted into the active meeting
                     AllowGuestToBypassLobby = true,
-                    TenantId = tenantId,
+                    TenantId = effectiveTenantId,
                 };
 
                 var call = await this.Client.Calls().AddAsync(joinParams, scenarioId).ConfigureAwait(false);
@@ -187,29 +248,26 @@ namespace TeamsCallingBot.Bot
                 CallHandler handler;
                 try
                 {
-                    handler = new CallHandler(call, this.graphLogger, chatInfo?.ThreadId, this.options?.OverrideBearerToken, meetingJoinUrl);
+                    handler = new CallHandler(call, this.graphLogger, chatInfo.ThreadId, this.options?.OverrideBearerToken, meetingJoinUrl);
+                    handler.RecordScreenShareOverride = recordVideo;
                 }
                 catch (Exception ex)
                 {
-                    this.graphLogger.Error(ex, $"CallHandler construction failed for call {call.Id} - hanging up the now-orphaned Graph-side call.");
+                    this.graphLogger.Error(ex, $"CallHandler construction failed for call {call.Id} - hanging up.");
                     try
                     {
                         await call.DeleteAsync().ConfigureAwait(false);
                     }
                     catch (Exception deleteEx)
                     {
-                        this.graphLogger.Error(deleteEx, $"Failed to hang up orphaned call {call.Id} after CallHandler construction failed.");
+                        this.graphLogger.Error(deleteEx, $"Failed to hang up orphaned call {call.Id}.");
                     }
 
                     throw;
                 }
 
                 this.CallHandlers[call.Id] = handler;
-
-                // NOTE: this only means the call was CREATED with Graph, NOT that the bot has joined.
-                // Actual join success is when CallHandler logs CallState.Established; if it doesn't
-                // within ~45s the join watchdog will warn. Do not treat this line as "joined".
-                this.graphLogger.Info($"[Join] Call CREATED (not yet joined): {call.Id} ({this.CallHandlers.Count} active calls now). Waiting for CallState.Established...");
+                this.graphLogger.Info($"[Join] Call CREATED: {call.Id} ({this.CallHandlers.Count} active calls). Waiting for CallState.Established...");
                 return call;
             }
             catch

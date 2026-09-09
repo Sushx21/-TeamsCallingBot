@@ -22,6 +22,8 @@ namespace TeamsCallingBot
             var options = BotOptions.LoadFromConfig();
             services.AddSingleton(options);
 
+            services.AddSingleton<MeetingRegistryService>();
+
             services.AddSingleton(sp => new TeamsCallingBot.Bot.Bot(sp.GetRequiredService<BotOptions>(), sp.GetRequiredService<IGraphLogger>()));
 
             services.AddMvc();
