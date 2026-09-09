@@ -129,7 +129,7 @@ namespace TeamsCallingBot.Config
         public bool AnnounceScreenShare { get; set; } = true;
 
         public string GreetingText { get; set; } =
-            "Hello everyone, I am the AI meeting assistant. I have joined to record this meeting and prepare the minutes.";
+            "Hello everyone, I am the TDA Secretary. I have joined to record this meeting and prepare the minutes.";
 
         /// <summary>
         /// Culture of the Windows TTS voice to prefer, e.g. "en-IN" for Indian English. The bot picks
