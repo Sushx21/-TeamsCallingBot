@@ -3,6 +3,7 @@
 namespace TeamsCallingBot.Common
 {
     using System;
+    using System.Collections.Generic;
     using System.IdentityModel.Tokens.Jwt;
     using System.Linq;
     using System.Net.Http;
@@ -28,6 +29,7 @@ namespace TeamsCallingBot.Common
     {
         private readonly string appId;
         private readonly string appSecret;
+        private readonly string defaultTenantId;
         private readonly string overrideBearerToken;
         private readonly TimeSpan openIdConfigRefreshInterval = TimeSpan.FromHours(2);
         private DateTime prevOpenIdConfigUpdateTimestamp = DateTime.MinValue;
@@ -43,11 +45,12 @@ namespace TeamsCallingBot.Common
         // "OverrideBearerToken" field whenever it goes stale. Not a long-term fix - the real fix is
         // getting Conditional Access to exempt this app's service principal so MSAL works normally
         // again, at which point this field should go back to empty/null.
-        public AuthenticationProvider(string appName, string appId, string appSecret, IGraphLogger logger, string overrideBearerToken = null)
+        public AuthenticationProvider(string appName, string appId, string appSecret, IGraphLogger logger, string overrideBearerToken = null, string defaultTenantId = null)
             : base(logger.NotNull(nameof(logger)).CreateShim(nameof(AuthenticationProvider)))
         {
             this.appId = appId.NotNullOrWhitespace(nameof(appId));
             this.appSecret = appSecret.NotNullOrWhitespace(nameof(appSecret));
+            this.defaultTenantId = defaultTenantId;
             this.overrideBearerToken = overrideBearerToken;
 
             // DIAGNOSTIC (2026-09-04, added after hitting Graph error 7505 "Request authorization
@@ -79,6 +82,74 @@ namespace TeamsCallingBot.Common
             }
         }
 
+        private static string cachedGraphToken;
+        private static DateTime graphTokenExpiry = DateTime.MinValue;
+        private static readonly object graphTokenLock = new object();
+
+        private async Task<string> AcquireTokenDirectAsync(string tenant)
+        {
+            lock (graphTokenLock)
+            {
+                if (!string.IsNullOrEmpty(cachedGraphToken) && DateTime.UtcNow < graphTokenExpiry)
+                {
+                    return cachedGraphToken;
+                }
+            }
+
+            string resolvedTenant = string.IsNullOrWhiteSpace(tenant) || tenant.Equals("common", StringComparison.OrdinalIgnoreCase)
+                ? (string.IsNullOrWhiteSpace(this.defaultTenantId) ? "f35425af-4755-4e0c-b1bb-b3cb9f1c6afd" : this.defaultTenantId)
+                : tenant;
+
+            string endpoint = $"https://login.microsoftonline.com/{resolvedTenant}/oauth2/v2.0/token";
+
+            try
+            {
+                using (var client = new HttpClient())
+                {
+                    var pairs = new List<KeyValuePair<string, string>>
+                    {
+                        new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                        new KeyValuePair<string, string>("client_id", this.appId),
+                        new KeyValuePair<string, string>("client_secret", this.appSecret),
+                        new KeyValuePair<string, string>("scope", "https://graph.microsoft.com/.default")
+                    };
+
+                    var content = new FormUrlEncodedContent(pairs);
+                    var resp = await client.PostAsync(endpoint, content).ConfigureAwait(false);
+                    var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var jobj = Newtonsoft.Json.Linq.JObject.Parse(json);
+                        string token = jobj["access_token"]?.ToString();
+                        int expiresIn = int.TryParse(jobj["expires_in"]?.ToString(), out int parsedExp) ? parsedExp : 3600;
+
+                        lock (graphTokenLock)
+                        {
+                            cachedGraphToken = token;
+                            graphTokenExpiry = DateTime.UtcNow.AddSeconds(expiresIn - 60);
+                        }
+
+                        Console.WriteLine($">>> [Graph Auth] Acquired token directly from {endpoint}, expires in {expiresIn}s");
+                        this.GraphLogger.Info($"[Graph Auth] Acquired token directly from {endpoint}");
+                        return token;
+                    }
+                    else
+                    {
+                        this.GraphLogger.Warn($"[Graph Auth] Direct token acquisition failed ({resp.StatusCode}): {json}");
+                        Console.WriteLine($">>> [Graph Auth] Direct token acquisition failed ({resp.StatusCode}): {json}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                this.GraphLogger.Warn($"[Graph Auth] Direct token request error: {ex.Message}");
+                Console.WriteLine($">>> [Graph Auth] Direct token request error: {ex.Message}");
+            }
+
+            return null;
+        }
+
         public async Task AuthenticateOutboundRequestAsync(HttpRequestMessage request, string tenant)
         {
             const string schema = "Bearer";
@@ -90,10 +161,23 @@ namespace TeamsCallingBot.Common
                 return;
             }
 
+            // 1. Try direct HTTP client-credentials acquisition (proven reliable, avoids MSAL authority quirks)
+            string directToken = await this.AcquireTokenDirectAsync(tenant).ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(directToken))
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue(schema, directToken);
+                return;
+            }
+
+            // 2. Fallback to MSAL
             const string oauthV2TokenLink = "https://login.microsoftonline.com/{tenant}";
             const string resource = "https://graph.microsoft.com";
 
-            tenant = string.IsNullOrWhiteSpace(tenant) ? "common" : tenant;
+            if (string.IsNullOrWhiteSpace(tenant) || tenant.Equals("common", StringComparison.OrdinalIgnoreCase))
+            {
+                tenant = string.IsNullOrWhiteSpace(this.defaultTenantId) ? "f35425af-4755-4e0c-b1bb-b3cb9f1c6afd" : this.defaultTenantId;
+            }
+
             var tokenLink = oauthV2TokenLink.Replace("{tenant}", tenant);
             var scopes = new[] { $"{resource}/.default" };
 

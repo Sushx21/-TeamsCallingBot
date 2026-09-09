@@ -51,7 +51,7 @@ namespace TeamsCallingBot.Bot
             var name = this.GetType().Assembly.GetName().Name;
             var builder = new CommunicationsClientBuilder(name, options.AadAppId, graphLogger);
 
-            var authProvider = new AuthenticationProvider(name, options.AadAppId, options.AadAppSecretOrCertThumbprint, graphLogger, options.OverrideBearerToken);
+            var authProvider = new AuthenticationProvider(name, options.AadAppId, options.AadAppSecretOrCertThumbprint, graphLogger, options.OverrideBearerToken, options.AadTenantId);
 
             // FIX (2026-09-04): fire-and-forget, started as early as possible (right here at Bot
             // construction, well before any real Graph notification can arrive) so the OpenID config
