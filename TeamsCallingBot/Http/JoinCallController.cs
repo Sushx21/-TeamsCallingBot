@@ -17,7 +17,6 @@ namespace TeamsCallingBot.Http
     /// Each call runs independently up to BotOptions.MaxConcurrentCalls (default 10).
     /// </summary>
     [Route("")]
-    [Route("/")]
     [Route("api/testjoin")]
     [Route("api/join")]
     [Route("api/calling/join")]
