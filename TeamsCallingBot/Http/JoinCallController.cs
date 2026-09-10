@@ -42,11 +42,25 @@ namespace TeamsCallingBot.Http
 
             var effectiveUserAdid = !string.IsNullOrWhiteSpace(request.UserAdid) ? request.UserAdid : request.Adid;
 
+            // Dynamically update OverrideBearerToken if provided in incoming request
+            var incomingToken = request.BearerToken ?? request.OverrideBearerToken ?? request.Token;
+            if (!string.IsNullOrWhiteSpace(incomingToken))
+            {
+                this.bot.Options.OverrideBearerToken = incomingToken.Trim();
+                Console.WriteLine(">>> [JoinCallController] Updated BotOptions.OverrideBearerToken dynamically from incoming request.");
+            }
+
             // Auto-register meetingId <-> meetingLink in local table resolver so any short-key or manual join can find it
             if (!string.IsNullOrWhiteSpace(request.MeetingId) && !string.IsNullOrWhiteSpace(request.MeetingLink))
             {
                 Common.MeetingLinkResolver.RegisterTableMapping(request.MeetingId, request.MeetingLink);
             }
+
+            // Pre-seed handy meeting URL in resolver
+            Common.MeetingLinkResolver.RegisterTableMapping(
+                "19:meeting_MTYyMjU2YWUtODY3Zi00ZDJlLWEyMzItMTU3ZDg5YWQ5Mjhl@thread.v2",
+                "https://teams.microsoft.com/l/meetup-join/19%3ameeting_MTYyMjU2YWUtODY3Zi00ZDJlLWEyMzItMTU3ZDg5YWQ5Mjhl%40thread.v2/0?context=%7b%22Tid%22%3a%22f35425af-4755-4e0c-b1bb-b3cb9f1c6afd%22%2c%22Oid%22%3a%22dc42a5b4-348d-483a-b362-7548d54e6bdb%22%7d");
+
 
             var urls = new List<string>();
 
@@ -76,7 +90,17 @@ namespace TeamsCallingBot.Http
 
             if (urls.Count == 0)
             {
-                return this.BadRequest(new { success = false, error = "At least one meetingLink, meetingUrl, or meetingId is required.", message = "At least one meetingLink, meetingUrl, or meetingId is required." });
+                var handyUrl = this.bot.Options?.TestMeetingJoinUrl;
+                if (!string.IsNullOrWhiteSpace(handyUrl))
+                {
+                    urls.Add(handyUrl.Trim());
+                    singleInputUrl = handyUrl.Trim();
+                    Console.WriteLine($">>> [JoinCallController] No meeting URL in payload; defaulting to handy meeting URL: {singleInputUrl}");
+                }
+                else
+                {
+                    return this.BadRequest(new { success = false, error = "At least one meetingLink, meetingUrl, or meetingId is required.", message = "At least one meetingLink, meetingUrl, or meetingId is required." });
+                }
             }
 
             var effectivePrompt = !string.IsNullOrWhiteSpace(request.Prompt)
@@ -382,6 +406,15 @@ namespace TeamsCallingBot.Http
         public string Prompt { get; set; }
 
         public bool RecordVideo { get; set; } = true;
+
+        [Newtonsoft.Json.JsonProperty("bearerToken")]
+        public string BearerToken { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("overrideBearerToken")]
+        public string OverrideBearerToken { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("token")]
+        public string Token { get; set; }
 
         // --- Production Table Schema Support ---
         [Newtonsoft.Json.JsonProperty("adid")]

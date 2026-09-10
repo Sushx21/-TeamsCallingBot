@@ -39,21 +39,27 @@ namespace TeamsCallingBot
                         var config = host.Services.GetRequiredService<IConfiguration>();
                         var urlsToJoin = new System.Collections.Generic.List<string>();
 
-                        var testUrl = config["Bot:TestMeetingJoinUrl"];
-                        if (!string.IsNullOrWhiteSpace(testUrl))
-                        {
-                            var split = testUrl.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-                                               .Select(u => u.Trim())
-                                               .Where(u => !string.IsNullOrWhiteSpace(u));
-                            urlsToJoin.AddRange(split);
-                        }
+                        bool autoJoin = false;
+                        bool.TryParse(config["Bot:AutoJoinOnStartup"], out autoJoin);
 
-                        var multiSection = config.GetSection("Bot:TestMeetingJoinUrls").GetChildren();
-                        foreach (var child in multiSection)
+                        if (autoJoin)
                         {
-                            if (!string.IsNullOrWhiteSpace(child.Value))
+                            var testUrl = config["Bot:TestMeetingJoinUrl"];
+                            if (!string.IsNullOrWhiteSpace(testUrl))
                             {
-                                urlsToJoin.Add(child.Value.Trim());
+                                var split = testUrl.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                                                   .Select(u => u.Trim())
+                                                   .Where(u => !string.IsNullOrWhiteSpace(u));
+                                urlsToJoin.AddRange(split);
+                            }
+
+                            var multiSection = config.GetSection("Bot:TestMeetingJoinUrls").GetChildren();
+                            foreach (var child in multiSection)
+                            {
+                                if (!string.IsNullOrWhiteSpace(child.Value))
+                                {
+                                    urlsToJoin.Add(child.Value.Trim());
+                                }
                             }
                         }
 

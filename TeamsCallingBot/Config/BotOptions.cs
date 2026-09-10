@@ -54,6 +54,8 @@ namespace TeamsCallingBot.Config
         /// </summary>
         public string OverrideBearerToken { get; set; }
 
+        public string TestMeetingJoinUrl { get; set; }
+
         /// <summary>
         /// Caps how many meetings this VM instance will join at once. Default of 100
         /// supports high-scale enterprise concurrent recording operations.

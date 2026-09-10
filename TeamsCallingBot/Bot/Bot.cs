@@ -86,6 +86,8 @@ namespace TeamsCallingBot.Bot
 
         public ICommunicationsClient Client { get; }
 
+        public BotOptions Options => this.options;
+
         public ConcurrentDictionary<string, CallHandler> CallHandlers { get; } = new ConcurrentDictionary<string, CallHandler>();
 
         public void Dispose()
