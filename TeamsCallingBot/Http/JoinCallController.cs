@@ -20,6 +20,7 @@ namespace TeamsCallingBot.Http
     [Route("api/join")]
     [Route("api/calling/join")]
     [Route("api/calls/join")]
+    [Route("joinCall")]
     public class JoinCallController : Controller
     {
         private readonly TeamsCallingBot.Bot.Bot bot;
