@@ -373,7 +373,7 @@ namespace TeamsCallingBot.Video
                 using (var textBrush = new SolidBrush(Color.White))
                 {
                     g.FillEllipse(dotBrush, 24, barY + 20, 14, 14);
-                    g.DrawString("TDA ASSISTANT  •  TATA STEEL", titleFont, textBrush, 48, barY + 16);
+                    g.DrawString("TDA SECY", titleFont, textBrush, 48, barY + 16);
                 }
 
                 // Dynamic Status on right
@@ -491,12 +491,16 @@ namespace TeamsCallingBot.Video
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
+                // Background color matching robot image canvas
+                g.Clear(Color.FromArgb(233, 225, 220));
+
                 string[] candidateMascotPaths = new[]
                 {
                     Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tda_mascot.png"),
                     Path.Combine(Directory.GetCurrentDirectory(), "tda_mascot.png"),
                     @"C:\Users\jaidevlalgame\Downloads\TeamsCallingBot\TeamsCallingBot\TeamsCallingBot\tda_mascot.png",
-                    @"C:\Users\jaidevlalgame\.gemini\antigravity-ide\brain\f7426c11-f2b4-4321-b705-cc2ba3f62f2c\.user_uploaded\media_1788939608057.png"
+                    @"C:\Users\jaidevlalgame\Downloads\TeamsCallingBot-Sushx21\TeamsCallingBot\tda_mascot.png",
+                    @"C:\Users\jaidevlalgame\.gemini\antigravity-ide\brain\f7426c11-f2b4-4321-b705-cc2ba3f62f2c\.user_uploaded\media_1789040057667.png"
                 };
 
                 string mascotPath = candidateMascotPaths.FirstOrDefault(File.Exists);
@@ -509,10 +513,17 @@ namespace TeamsCallingBot.Video
                     {
                         using (var mascot = Image.FromFile(mascotPath))
                         {
-                            int srcX = 4;
-                            int srcY = 15;
-                            int srcW = mascot.Width - 8;
-                            int srcH = mascot.Height - 30;
+                            int srcX = 0;
+                            int srcY = 0;
+                            int srcW = mascot.Width;
+                            int srcH = mascot.Height;
+
+                            // If raw uncropped screenshot (1024x466 with pillarboxes), crop black sidebars
+                            if (mascot.Width == 1024 && mascot.Height == 466)
+                            {
+                                srcX = 17;
+                                srcW = 981;
+                            }
 
                             float scale = Math.Max(1280f / srcW, (float)availH / srcH);
                             int dstW = (int)(srcW * scale);
