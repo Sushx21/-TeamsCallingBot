@@ -14,6 +14,7 @@ namespace TeamsCallingBot.Bot
     using Microsoft.Skype.Bots.Media;
     using TeamsCallingBot.Common;
     using TeamsCallingBot.Config;
+    using TeamsCallingBot.Storage;
 
     /// <summary>
     /// Builds the Graph Communications client and joins a specific meeting by its join URL, with a
@@ -199,6 +200,19 @@ namespace TeamsCallingBot.Bot
                     $"Refusing to join - already at the configured concurrency cap ({this.CallHandlers.Count} active calls).");
             }
 
+            // 2b. Distributed Firestore Lock check (cross-instance deduplication for 100 concurrent instances)
+            bool lockAcquired = await FirestoreMeetingLockService.Instance.TryAcquireLockAsync(
+                threadId,
+                meetingJoinUrl ?? threadId).ConfigureAwait(false);
+
+            if (!lockAcquired)
+            {
+                this.concurrentCallSlots.Release();
+                this.graphLogger.Warn($"[Join] Meeting '{threadId}' is already locked or joined by another instance. Skipping duplicate join.");
+                Console.WriteLine($">>> [Join] Skipped duplicate join: meeting '{threadId}' is already locked or joined by another instance.");
+                return null;
+            }
+
             try
             {
                 string effectiveTenantId = !string.IsNullOrWhiteSpace(tenantId)
@@ -273,6 +287,7 @@ namespace TeamsCallingBot.Bot
             catch
             {
                 this.concurrentCallSlots.Release();
+                _ = FirestoreMeetingLockService.Instance.ReleaseLockAsync(threadId);
                 throw;
             }
         }

@@ -65,6 +65,96 @@ namespace TeamsCallingBot.Storage
             return result;
         }
 
+        /// <summary>
+        /// Uploads the meeting audio mix (02_audio_meeting_both_ways.wav) to GCS.
+        /// </summary>
+        public async Task<string> UploadAudioFilesAsync(string sessionDirectory, string callId, string chatThreadId)
+        {
+            if (!this.options.UploadAudio) return null;
+
+            string audioPath = Path.Combine(sessionDirectory, "02_audio_meeting_both_ways.wav");
+            if (!File.Exists(audioPath))
+            {
+                var wavs = Directory.GetFiles(sessionDirectory, "02_audio_*.wav");
+                if (wavs.Length > 0) audioPath = wavs[0];
+            }
+
+            string objectName = BuildObjectName(this.options.AudioObjectPathTemplate, callId, chatThreadId);
+            return await this.UploadFileAsync(audioPath, objectName, "audio/wav", "Audio mix").ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Uploads the screen share recording (.mp4 or .avi) to GCS.
+        /// </summary>
+        public async Task<string> UploadVideoFilesAsync(string sessionDirectory, string callId, string chatThreadId)
+        {
+            if (!this.options.UploadVideo) return null;
+
+            string videoPath = Path.Combine(sessionDirectory, "03_screenshare_recording.mp4");
+            if (!File.Exists(videoPath))
+            {
+                videoPath = Path.Combine(sessionDirectory, "03_screenshare_recording.avi");
+            }
+            if (!File.Exists(videoPath))
+            {
+                var vids = Directory.GetFiles(sessionDirectory, "*screen*.avi");
+                if (vids.Length == 0) vids = Directory.GetFiles(sessionDirectory, "*screen*.mp4");
+                if (vids.Length > 0) videoPath = vids[0];
+            }
+
+            string contentType = videoPath.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) ? "video/mp4" : "video/x-msvideo";
+            string objectName = BuildObjectName(this.options.VideoObjectPathTemplate, callId, chatThreadId);
+            return await this.UploadFileAsync(videoPath, objectName, contentType, "Screen share video").ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Uploads all session artifacts (MoM Word doc, transcript files, audio mix, and screen share video)
+        /// to GCS, returning the signed URLs.
+        /// </summary>
+        public async Task<SessionUploadResult> UploadFullSessionAsync(string sessionDirectory, string callId, string chatThreadId, string momDocxPath = null)
+        {
+            var result = new SessionUploadResult();
+
+            if (string.IsNullOrWhiteSpace(momDocxPath))
+            {
+                var candidate = Path.Combine(sessionDirectory, "08_minutes_of_meeting.docx");
+                if (File.Exists(candidate))
+                {
+                    momDocxPath = candidate;
+                }
+            }
+
+            // 1. MoM document
+            if (!string.IsNullOrWhiteSpace(momDocxPath) && File.Exists(momDocxPath))
+            {
+                result.MomUrl = await this.UploadMomDocumentAsync(momDocxPath, callId, chatThreadId).ConfigureAwait(false);
+            }
+
+            // 2. Transcripts
+            var transcripts = await this.UploadTranscriptFilesAsync(sessionDirectory, callId, chatThreadId).ConfigureAwait(false);
+            result.TranscriptTextUrl = transcripts?.TextUrl;
+            result.TranscriptJsonUrl = transcripts?.JsonUrl;
+
+            // 3. Audio mix
+            result.AudioUrl = await this.UploadAudioFilesAsync(sessionDirectory, callId, chatThreadId).ConfigureAwait(false);
+
+            // 4. Video recording
+            result.VideoUrl = await this.UploadVideoFilesAsync(sessionDirectory, callId, chatThreadId).ConfigureAwait(false);
+
+            result.Success = !string.IsNullOrWhiteSpace(result.MomUrl) || !string.IsNullOrWhiteSpace(result.AudioUrl) || !string.IsNullOrWhiteSpace(result.TranscriptTextUrl);
+            return result;
+        }
+
+        public class SessionUploadResult
+        {
+            public bool Success { get; set; }
+            public string MomUrl { get; set; }
+            public string TranscriptTextUrl { get; set; }
+            public string TranscriptJsonUrl { get; set; }
+            public string AudioUrl { get; set; }
+            public string VideoUrl { get; set; }
+        }
+
         public sealed class TranscriptUrls
         {
             public string TextUrl { get; set; }

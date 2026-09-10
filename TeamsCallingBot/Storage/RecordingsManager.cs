@@ -207,6 +207,71 @@ namespace TeamsCallingBot.Storage
             this.Log($"[Session Metadata Saved] {metaPath}");
         }
 
+        /// <summary>
+        /// Cleans up heavy raw audio and video recording files (.wav, .mp4, .avi, live_chunk_*.wav)
+        /// from the VM disk after GCS upload has completed, keeping the VM disk clean and preventing
+        /// disk exhaustion when processing 100 concurrent or 1000 daily meetings.
+        /// Preserves 08_minutes_of_meeting.docx, session_metadata.json, and 01_logs_bot_activity.txt.
+        /// </summary>
+        public int CleanupLocalMediaFiles(bool preserveDocsAndLogs = true)
+        {
+            if (string.IsNullOrWhiteSpace(this.SessionDirectory) || !Directory.Exists(this.SessionDirectory))
+            {
+                return 0;
+            }
+
+            lock (this.fileLock)
+            {
+                int deletedCount = 0;
+                try
+                {
+                    long bytesFreed = 0;
+
+                    // Delete audio WAV files
+                    var audioFiles = Directory.GetFiles(this.SessionDirectory, "*.wav");
+                    foreach (var file in audioFiles)
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(file);
+                            bytesFreed += fi.Length;
+                            File.Delete(file);
+                            deletedCount++;
+                        }
+                        catch { }
+                    }
+
+                    // Delete video files (.mp4, .avi, temp .raw)
+                    var videoPatterns = new[] { "*.mp4", "*.avi", "*.mjpg", "*.raw" };
+                    foreach (var pat in videoPatterns)
+                    {
+                        var videoFiles = Directory.GetFiles(this.SessionDirectory, pat);
+                        foreach (var file in videoFiles)
+                        {
+                            try
+                            {
+                                var fi = new FileInfo(file);
+                                bytesFreed += fi.Length;
+                                File.Delete(file);
+                                deletedCount++;
+                            }
+                            catch { }
+                        }
+                    }
+
+                    double mbFreed = bytesFreed / (1024.0 * 1024.0);
+                    this.Log($"[VM Disk Cleanup] Deleted {deletedCount} raw media files, freed {mbFreed:F1} MB on VM disk.");
+                    Console.WriteLine($">>> [VM Disk Cleanup] Cleaned {deletedCount} media files ({mbFreed:F1} MB freed) in '{Path.GetFileName(this.SessionDirectory)}'");
+                    return deletedCount;
+                }
+                catch (Exception ex)
+                {
+                    this.Log($"[VM Disk Cleanup Warning] Failed cleaning some files: {ex.Message}");
+                    return deletedCount;
+                }
+            }
+        }
+
         private static string ResolveDefaultDirectory()
         {
             // Priority 0: Configured TranscriptOutputFolder in appsettings.json

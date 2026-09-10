@@ -195,6 +195,12 @@ namespace TeamsCallingBot.Config
 
         public TdaOptions Tda { get; set; } = new TdaOptions();
 
+        // -------------------------------------------------------------------------------------
+        // Google Cloud Firestore - distributed idempotency lock for multi-instance deployments
+        // -------------------------------------------------------------------------------------
+
+        public FirestoreOptions Firestore { get; set; } = new FirestoreOptions();
+
         /// <summary>
         /// Set once at startup (Startup.cs) so static classes without DI access (TranscriptSaver)
         /// can still read config. Deliberately simple - this process only ever loads one BotOptions.
@@ -228,6 +234,11 @@ namespace TeamsCallingBot.Config
             if (options.Tda == null)
             {
                 options.Tda = new TdaOptions();
+            }
+
+            if (options.Firestore == null)
+            {
+                options.Firestore = new FirestoreOptions();
             }
 
             Current = options;
@@ -314,6 +325,21 @@ namespace TeamsCallingBot.Config
         /// <summary>Object path template for the structured transcript (04_transcript.json).</summary>
         public string TranscriptJsonObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/04_transcript.json";
 
+        /// <summary>Upload the audio mix WAV to GCS.</summary>
+        public bool UploadAudio { get; set; } = true;
+
+        /// <summary>Upload the screen-share MP4/AVI video to GCS.</summary>
+        public bool UploadVideo { get; set; } = true;
+
+        /// <summary>Object path template for the meeting audio mix (02_audio_meeting_both_ways.wav).</summary>
+        public string AudioObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/02_audio_meeting_both_ways.wav";
+
+        /// <summary>Object path template for the screen share video (03_screenshare_recording.mp4).</summary>
+        public string VideoObjectPathTemplate { get; set; } = "meetings/{ChatThreadId}/{CallId}/03_screenshare_recording.mp4";
+
+        /// <summary>Purge local raw audio and video files from the VM disk after successful upload to prevent disk exhaustion.</summary>
+        public bool PurgeLocalMediaAfterUpload { get; set; } = true;
+
         /// <summary>How long the signed download URL stays valid for.</summary>
         public int SignedUrlExpiryHours { get; set; } = 168; // 7 days
     }
@@ -396,5 +422,28 @@ namespace TeamsCallingBot.Config
         /// text into the meeting. Longer answers are truncated with "...".
         /// </summary>
         public int MaxSpokenAnswerChars { get; set; } = 600;
+    }
+
+    /// <summary>
+    /// Configuration for Google Cloud Firestore distributed meeting locking.
+    /// Prevents duplicate joins when scaling to 100 concurrent meetings across multiple bot instances.
+    /// Falls back to in-memory locking if not enabled or credentials are missing.
+    /// </summary>
+    public class FirestoreOptions
+    {
+        /// <summary>Master switch for distributed Firestore lock.</summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>Google Cloud project id holding the Firestore database.</summary>
+        public string ProjectId { get; set; } = string.Empty;
+
+        /// <summary>Collection name for lock documents.</summary>
+        public string CollectionName { get; set; } = "meeting_join_locks";
+
+        /// <summary>Path to Google Cloud Service Account JSON file.</summary>
+        public string ServiceAccountKeyPath { get; set; } = string.Empty;
+
+        /// <summary>Lock TTL in minutes before expiring stale locks.</summary>
+        public int LockTtlMinutes { get; set; } = 30;
     }
 }

@@ -69,10 +69,12 @@ namespace TeamsCallingBot.Http
                     var call = await this.bot.JoinCallAsync(singleUrl).ConfigureAwait(false);
                     return this.Ok(new
                     {
-                        callId = call.Id,
+                        callId = call?.Id,
                         meetingJoinUrl = singleUrl,
-                        status = "CallCreated",
-                        note = "Call CREATED. It is joined once state reaches Established - check logs."
+                        status = call != null ? "CallCreated" : "AlreadyJoinedOrLocked",
+                        note = call != null
+                            ? "Call CREATED. It is joined once state reaches Established - check logs."
+                            : "Meeting is already locked or joined by another instance."
                     });
                 }
                 catch (ArgumentException ex)
@@ -89,38 +91,44 @@ namespace TeamsCallingBot.Http
                 }
             }
 
-            // Multiple URLs case (3-4 meetings concurrently)
-            var joinTasks = urls.Select(async url =>
+            // Multiple URLs case - staggered joins with 1.5s interval to prevent Graph 500#1203003 burst errors
+            var results = new List<object>();
+            for (int i = 0; i < urls.Count; i++)
             {
+                var url = urls[i];
+                if (i > 0)
+                {
+                    await Task.Delay(1500).ConfigureAwait(false);
+                }
+
                 try
                 {
                     var call = await this.bot.JoinCallAsync(url).ConfigureAwait(false);
-                    return new
+                    results.Add(new
                     {
-                        success = true,
+                        success = call != null,
                         meetingJoinUrl = url,
-                        callId = call.Id,
-                        status = "CallCreated",
-                        error = (string)null
-                    };
+                        callId = call?.Id,
+                        status = call != null ? "CallCreated" : "AlreadyJoinedOrLocked",
+                        error = call == null ? "Meeting is already locked or joined by another instance." : (string)null
+                    });
                 }
                 catch (Exception ex)
                 {
-                    return new
+                    results.Add(new
                     {
                         success = false,
                         meetingJoinUrl = url,
                         callId = (string)null,
                         status = "Failed",
                         error = ex.Message
-                    };
+                    });
                 }
-            });
+            }
 
-            var results = await Task.WhenAll(joinTasks).ConfigureAwait(false);
             return this.Ok(new
             {
-                message = $"Processed {results.Length} concurrent join requests.",
+                message = $"Processed {results.Count} join requests with staggered scheduling.",
                 activeCallsCount = this.bot.CallHandlers.Count,
                 results = results
             });

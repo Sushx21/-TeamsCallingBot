@@ -122,6 +122,7 @@ namespace TeamsCallingBot.Bot
         private readonly string chatThreadId;
         private readonly string botAccessToken;
         private readonly BotFrameworkChatClient chatClient;
+        private readonly string meetingJoinUrl;
 
         // Real-Time Voice Speech Recognition & Live Transcripts
         private readonly RealtimeSpeechRecognizer voiceRecognizer;
@@ -143,6 +144,7 @@ namespace TeamsCallingBot.Bot
             this.graphLogger = logger;
             this.sessionStartTime = DateTime.Now;
             this.chatThreadId = chatThreadId;
+            this.meetingJoinUrl = meetingJoinUrl;
             this.options = BotOptions.Current ?? new BotOptions();
             this.botAccessToken = accessToken ?? this.options.OverrideBearerToken;
 
@@ -992,15 +994,17 @@ namespace TeamsCallingBot.Bot
                     {
                         var previewPath = this.RecordingsManager.SavePhoto(previewCard, "05_bot_broadcast_preview");
                         this.graphLogger.Info($"[Bot Video Streaming] Saved broadcast preview: {previewPath}");
+
+                        // Pre-warm initial card frame into buffer 0 for instant zero-latency broadcast
+                        var initialFormat = this.preferredSendFormat ?? VideoFormat.NV12_1280x720_15Fps;
+                        byte[] initialNv12 = VideoFrameConverter.ConvertBitmapToNV12(previewCard, initialFormat.Width, initialFormat.Height);
+                        Marshal.Copy(initialNv12, 0, videoBufferPool[0], Math.Min(initialNv12.Length, maxBufSize));
                     }
                 }
                 catch (Exception ex)
                 {
                     this.graphLogger.Warn($"Failed to save preview: {ex.Message}");
                 }
-
-                // Initial safety delay: allow call & media socket to settle
-                await Task.Delay(2000, token).ConfigureAwait(false);
 
                 try
                 {
@@ -1394,6 +1398,12 @@ namespace TeamsCallingBot.Bot
                     this.Timeline.AddEvent("call_established", this.Call.Id);
                     _ = Task.Run(() => this.PostTextMessageToChatAsync(
                         "🤖 <b>Teams AI Assistant</b> has joined the meeting.<br/>• Audio recording &amp; per-speaker capture: <b>Active</b><br/>• Screen share video recording: <b>Ready</b> (starts automatically when someone shares)<br/>• Bot video status tile: <b>Active</b>"));
+                }
+
+                // Confirm in Firestore Distributed Lock that this call is active
+                if (!string.IsNullOrWhiteSpace(this.meetingJoinUrl))
+                {
+                    _ = FirestoreMeetingLockService.Instance.ConfirmJoinedAsync(this.meetingJoinUrl, this.Call.Id);
                 }
 
                 try
@@ -1874,6 +1884,52 @@ namespace TeamsCallingBot.Bot
                 SessionDirectory = this.RecordingsManager.SessionDirectory
             };
             this.RecordingsManager.SaveMetadata(metadata);
+
+            // 8. Upload to Google Cloud Storage (Transcripts, MoM, Audio, Video)
+            if (this.options.Gcs?.Enabled == true)
+            {
+                try
+                {
+                    this.graphLogger.Info($"[GCS Archival] Uploading session assets to gs://{this.options.Gcs.BucketName}...");
+                    Console.WriteLine($">>> [GCS Archival] Uploading session assets to gs://{this.options.Gcs.BucketName}...");
+
+                    var uploader = new GcsUploader(this.options.Gcs, this.RecordingsManager.Log);
+                    var gcsResult = await uploader.UploadFullSessionAsync(
+                        this.RecordingsManager.SessionDirectory,
+                        this.Call.Id,
+                        this.chatThreadId).ConfigureAwait(false);
+
+                    string primaryUri = gcsResult.TranscriptTextUrl ?? gcsResult.MomUrl ?? gcsResult.AudioUrl;
+                    this.graphLogger.Info($"[GCS Archival] Full session upload complete: {primaryUri}");
+                    Console.WriteLine($">>> [GCS Archival] Full session uploaded successfully: {primaryUri}");
+
+                    // 9. VM Disk Cleanup - purge heavy media (WAV/MP4/AVI) post-upload to avoid disk exhaustion
+                    if (this.options.Gcs.PurgeLocalMediaAfterUpload)
+                    {
+                        int cleanedCount = this.RecordingsManager.CleanupLocalMediaFiles(preserveDocsAndLogs: true);
+                        this.graphLogger.Info($"[Disk Cleanup] Purged {cleanedCount} raw media files from VM disk.");
+                        Console.WriteLine($">>> [Disk Cleanup] Purged {cleanedCount} raw media files from VM disk post-upload.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    this.graphLogger.Error(ex, "[GCS Archival] Failed to upload session assets to GCS.");
+                    Console.WriteLine($">>> [GCS Archival] Failed: {ex.Message}");
+                }
+            }
+
+            // 10. Release Firestore Distributed Lock
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(this.meetingJoinUrl))
+                {
+                    await FirestoreMeetingLockService.Instance.ReleaseLockAsync(this.meetingJoinUrl, this.Call.Id).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                this.graphLogger.Warn($"[Firestore Lock] Release failed: {ex.Message}");
+            }
 
             this.graphLogger.Info($"[Session Complete] All assets saved to {this.RecordingsManager.SessionDirectory}");
             Console.WriteLine($">>> [Session Complete] All assets saved to {this.RecordingsManager.SessionDirectory}");

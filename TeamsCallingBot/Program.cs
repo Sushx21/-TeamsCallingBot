@@ -77,8 +77,15 @@ namespace TeamsCallingBot
                                                 ? await bot.JoinCallAsync(p.MeetingJoinUrl, p.RecordVideo).ConfigureAwait(false)
                                                 : await bot.JoinCallByCoordinatesAsync(p.ThreadId, recordVideo: p.RecordVideo).ConfigureAwait(false);
 
-                                            registry.MarkJoined(p.Id, call.Id);
-                                            Console.WriteLine($">>> [Scheduler] Registered meeting joined: '{p.Subject}' (CallId: {call.Id})");
+                                            if (call != null)
+                                            {
+                                                registry.MarkJoined(p.Id, call.Id);
+                                                Console.WriteLine($">>> [Scheduler] Registered meeting joined: '{p.Subject}' (CallId: {call.Id})");
+                                            }
+                                            else
+                                            {
+                                                Console.WriteLine($">>> [Scheduler] Registered meeting skipped (already locked by another instance): '{p.Subject}'");
+                                            }
                                         }
                                         catch (Exception ex)
                                         {
@@ -87,6 +94,9 @@ namespace TeamsCallingBot
                                             Console.WriteLine($">>> [Scheduler] Registered meeting join failed: '{p.Subject}': {ex.Message}");
                                         }
                                     });
+
+                                    // Stagger scheduled joins
+                                    await Task.Delay(2000).ConfigureAwait(false);
                                 }
                             }
                         }
@@ -104,17 +114,43 @@ namespace TeamsCallingBot
                             _ = Task.Run(async () =>
                             {
                                 Console.WriteLine($">>> AUTO/SCHEDULED JOIN starting for: {url}");
-                                try
+                                const int maxAttempts = 3;
+                                for (int attempt = 1; attempt <= maxAttempts; attempt++)
                                 {
-                                    var call = await bot.JoinCallAsync(url).ConfigureAwait(false);
-                                    Console.WriteLine($">>> AUTO/SCHEDULED JOIN accepted. Call id: {call.Id}");
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($">>> AUTO/SCHEDULED JOIN FAILED for {url}: {ex.GetType().Name}: {ex.Message}");
-                                    joinedUrls.Remove(url); // Allow retry
+                                    try
+                                    {
+                                        var call = await bot.JoinCallAsync(url).ConfigureAwait(false);
+                                        if (call != null)
+                                        {
+                                            Console.WriteLine($">>> AUTO/SCHEDULED JOIN accepted. Call id: {call.Id}");
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine($">>> AUTO/SCHEDULED JOIN skipped: Meeting already locked/active on another instance.");
+                                        }
+                                        return;
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        bool isServerError = ex.Message.Contains("500") || ex.Message.Contains("1203003") || ex.Message.Contains("Internal Server Error");
+                                        if (attempt < maxAttempts && isServerError)
+                                        {
+                                            int backoff = attempt * 3;
+                                            Console.WriteLine($">>> AUTO/SCHEDULED JOIN transient 500 error for {url} (attempt {attempt}/{maxAttempts}). Retrying in {backoff}s: {ex.Message}");
+                                            await Task.Delay(TimeSpan.FromSeconds(backoff)).ConfigureAwait(false);
+                                        }
+                                        else
+                                        {
+                                            Console.WriteLine($">>> AUTO/SCHEDULED JOIN FAILED for {url}: {ex.GetType().Name}: {ex.Message}");
+                                            joinedUrls.Remove(url); // Allow retry
+                                            return;
+                                        }
+                                    }
                                 }
                             });
+
+                            // 2-second stagger between launching joins to eliminate Graph 500#1203003 SDP burst rate limit
+                            await Task.Delay(2000).ConfigureAwait(false);
                         }
                     }
                     catch (Exception loopEx)
