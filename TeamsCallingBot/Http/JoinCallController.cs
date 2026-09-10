@@ -34,7 +34,7 @@ namespace TeamsCallingBot.Http
         {
             if (request == null)
             {
-                return this.BadRequest(new { error = "Request body is required." });
+                return this.BadRequest(new { success = false, error = "Request body is required.", message = "Request body is required." });
             }
 
             var urls = new List<string>();
@@ -44,9 +44,13 @@ namespace TeamsCallingBot.Http
                 urls.AddRange(request.MeetingJoinUrls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim()));
             }
 
-            if (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl))
+            var singleInputUrl = !string.IsNullOrWhiteSpace(request.MeetingUrl)
+                ? request.MeetingUrl
+                : request.MeetingJoinUrl;
+
+            if (!string.IsNullOrWhiteSpace(singleInputUrl))
             {
-                var split = request.MeetingJoinUrl
+                var split = singleInputUrl
                     .Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
                     .Select(u => u.Trim())
                     .Where(u => !string.IsNullOrWhiteSpace(u));
@@ -57,37 +61,56 @@ namespace TeamsCallingBot.Http
 
             if (urls.Count == 0)
             {
-                return this.BadRequest(new { error = "At least one MeetingJoinUrl or MeetingJoinUrls entry is required." });
+                return this.BadRequest(new { success = false, error = "At least one meetingUrl or MeetingJoinUrl is required.", message = "At least one meetingUrl or MeetingJoinUrl is required." });
             }
 
-            // Single URL case (for direct backward compatibility)
+            // Single URL case (for direct compatibility with teamsBot.js and API callers)
             if (urls.Count == 1)
             {
                 var singleUrl = urls[0];
                 try
                 {
-                    var call = await this.bot.JoinCallAsync(singleUrl).ConfigureAwait(false);
+                    var call = await this.bot.JoinCallAsync(
+                        singleUrl,
+                        request.RecordVideo,
+                        request.UserAdid,
+                        request.TranscriptFileName,
+                        request.Prompt).ConfigureAwait(false);
+
+                    if (call == null)
+                    {
+                        return this.Ok(new
+                        {
+                            success = false,
+                            status = "AlreadyJoinedOrLocked",
+                            callId = (string)null,
+                            meetingUrl = singleUrl,
+                            message = "I'm already joining or have joined this meeting. Please wait a moment."
+                        });
+                    }
+
                     return this.Ok(new
                     {
-                        callId = call?.Id,
-                        meetingJoinUrl = singleUrl,
-                        status = call != null ? "CallCreated" : "AlreadyJoinedOrLocked",
-                        note = call != null
-                            ? "Call CREATED. It is joined once state reaches Established - check logs."
-                            : "Meeting is already locked or joined by another instance."
+                        success = true,
+                        status = "CallCreated",
+                        callId = call.Id,
+                        meetingUrl = singleUrl,
+                        userAdid = request.UserAdid,
+                        transcriptfilename = request.TranscriptFileName,
+                        message = "AI Meeting Assistant joined the call successfully."
                     });
                 }
                 catch (ArgumentException ex)
                 {
-                    return this.BadRequest(new { error = ex.Message, meetingJoinUrl = singleUrl });
+                    return this.BadRequest(new { success = false, error = ex.Message, message = "Could not parse meeting link: " + ex.Message, meetingUrl = singleUrl });
                 }
                 catch (InvalidOperationException ex)
                 {
-                    return this.StatusCode(429, new { error = ex.Message, meetingJoinUrl = singleUrl });
+                    return this.StatusCode(429, new { success = false, error = ex.Message, message = "Bot busy at maximum capacity: " + ex.Message, meetingUrl = singleUrl });
                 }
                 catch (Exception ex)
                 {
-                    return this.StatusCode(500, new { error = "Join failed unexpectedly.", detail = ex.Message, meetingJoinUrl = singleUrl });
+                    return this.StatusCode(500, new { success = false, error = "Join failed unexpectedly.", detail = ex.Message, message = "Internal error joining meeting: " + ex.Message, meetingUrl = singleUrl });
                 }
             }
 
@@ -175,6 +198,19 @@ namespace TeamsCallingBot.Http
     {
         public string MeetingJoinUrl { get; set; }
         public List<string> MeetingJoinUrls { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingUrl")]
+        public string MeetingUrl { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("userAdid")]
+        public string UserAdid { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("transcriptfilename")]
+        public string TranscriptFileName { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("prompt")]
+        public string Prompt { get; set; }
+
         public bool RecordVideo { get; set; } = true;
     }
 

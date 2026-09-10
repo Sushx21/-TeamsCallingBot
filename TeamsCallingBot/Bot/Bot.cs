@@ -133,7 +133,12 @@ namespace TeamsCallingBot.Bot
                 mediaSessionId: Guid.NewGuid());
         }
 
-        public async Task<ICall> JoinCallAsync(string meetingJoinUrl, bool recordVideo = true)
+        public async Task<ICall> JoinCallAsync(
+            string meetingJoinUrl,
+            bool recordVideo = true,
+            string userAdid = null,
+            string transcriptFileName = null,
+            string prompt = null)
         {
             if (string.IsNullOrWhiteSpace(meetingJoinUrl))
             {
@@ -159,7 +164,10 @@ namespace TeamsCallingBot.Bot
                 tenantId,
                 organizerId,
                 recordVideo,
-                meetingJoinUrl).ConfigureAwait(false);
+                meetingJoinUrl,
+                userAdid,
+                transcriptFileName,
+                prompt).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -172,7 +180,10 @@ namespace TeamsCallingBot.Bot
             string tenantId = null,
             string organizerOid = null,
             bool recordVideo = true,
-            string meetingJoinUrl = null)
+            string meetingJoinUrl = null,
+            string userAdid = null,
+            string transcriptFileName = null,
+            string prompt = null)
         {
             if (string.IsNullOrWhiteSpace(threadId))
             {
@@ -262,8 +273,13 @@ namespace TeamsCallingBot.Bot
                 CallHandler handler;
                 try
                 {
-                    handler = new CallHandler(call, this.graphLogger, chatInfo.ThreadId, this.options?.OverrideBearerToken, meetingJoinUrl);
-                    handler.RecordScreenShareOverride = recordVideo;
+                    handler = new CallHandler(call, this.graphLogger, chatInfo.ThreadId, this.options?.OverrideBearerToken, meetingJoinUrl)
+                    {
+                        RecordScreenShareOverride = recordVideo,
+                        UserAdid = userAdid,
+                        TranscriptFileName = transcriptFileName,
+                        Prompt = prompt
+                    };
                 }
                 catch (Exception ex)
                 {

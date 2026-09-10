@@ -137,6 +137,58 @@ namespace TeamsCallingBot.Bot
         /// </summary>
         public bool RecordScreenShareOverride { get; set; } = true;
 
+        private string userAdid;
+        public string UserAdid
+        {
+            get => this.userAdid;
+            set
+            {
+                this.userAdid = value;
+                if (!string.IsNullOrWhiteSpace(value) && this.RecordingsManager != null)
+                {
+                    try
+                    {
+                        System.IO.File.WriteAllText(System.IO.Path.Combine(this.RecordingsManager.SessionDirectory, "user_adid.txt"), value, System.Text.Encoding.UTF8);
+                        this.RecordingsManager.Log($"[User ADID] {value}");
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private string prompt;
+        public string Prompt
+        {
+            get => this.prompt;
+            set
+            {
+                this.prompt = value;
+                if (!string.IsNullOrWhiteSpace(value) && this.RecordingsManager != null)
+                {
+                    try
+                    {
+                        System.IO.File.WriteAllText(System.IO.Path.Combine(this.RecordingsManager.SessionDirectory, "prompt.txt"), value, System.Text.Encoding.UTF8);
+                        this.RecordingsManager.Log($"[Summary Prompt Saved] {value.Length} characters");
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private string transcriptFileName;
+        public string TranscriptFileName
+        {
+            get => this.transcriptFileName;
+            set
+            {
+                this.transcriptFileName = value;
+                if (!string.IsNullOrWhiteSpace(value) && this.RecordingsManager != null)
+                {
+                    this.RecordingsManager.Log($"[Transcript File Name] {value}");
+                }
+            }
+        }
+
         public CallHandler(ICall call, IGraphLogger logger, string chatThreadId = null, string accessToken = null, string meetingJoinUrl = null)
             : base(TimeSpan.FromMinutes(1), logger)
         {
