@@ -75,7 +75,22 @@ namespace TeamsCallingBot.Common
             var trimmed = rawInput.Trim();
 
             // ------------------------------------------------------------------------
-            // 1. Direct 19:...@thread.v2 Meeting ID Check
+            // 1. Auto-Extract Long Meetup-Join URL from text (PRESERVES ?context={"Tid":...,"Oid":...})
+            // ------------------------------------------------------------------------
+            var longMatch = LongJoinRegex.Match(trimmed);
+            if (longMatch.Success)
+            {
+                var cleanLongUrl = CleanUrl(longMatch.Value);
+                return new ResolutionResult
+                {
+                    Success = true,
+                    ResolvedUrl = cleanLongUrl,
+                    Source = "AutoExtractedLongUrl"
+                };
+            }
+
+            // ------------------------------------------------------------------------
+            // 2. Direct 19:...@thread.v2 Meeting ID Check (Only when no full URL present)
             // ------------------------------------------------------------------------
             var threadMatch = DirectThreadIdRegex.Match(trimmed);
             if (threadMatch.Success)
@@ -88,21 +103,6 @@ namespace TeamsCallingBot.Common
                     ThreadId = threadId,
                     ResolvedUrl = $"https://teams.microsoft.com/l/meetup-join/{Uri.EscapeDataString(threadId)}/0",
                     Source = "DirectThreadId"
-                };
-            }
-
-            // ------------------------------------------------------------------------
-            // 2. Auto-Extract Long Meetup-Join URL from text
-            // ------------------------------------------------------------------------
-            var longMatch = LongJoinRegex.Match(trimmed);
-            if (longMatch.Success)
-            {
-                var cleanLongUrl = CleanUrl(longMatch.Value);
-                return new ResolutionResult
-                {
-                    Success = true,
-                    ResolvedUrl = cleanLongUrl,
-                    Source = "AutoExtractedLongUrl"
                 };
             }
 

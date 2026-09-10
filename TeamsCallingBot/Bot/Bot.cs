@@ -252,6 +252,17 @@ namespace TeamsCallingBot.Bot
 
             try
             {
+                if (string.IsNullOrWhiteSpace(organizerOid) && !string.IsNullOrWhiteSpace(meetingJoinUrl) && meetingJoinUrl.IndexOf("context=", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    try
+                    {
+                        var (_, pMeetingInfo, pTenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
+                        organizerOid = (pMeetingInfo as OrganizerMeetingInfo)?.Organizer?.User?.Id;
+                        if (string.IsNullOrWhiteSpace(tenantId)) tenantId = pTenantId;
+                    }
+                    catch { }
+                }
+
                 string effectiveTenantId = !string.IsNullOrWhiteSpace(tenantId)
                     ? tenantId
                     : (this.options?.AadTenantId ?? "f35425af-4755-4e0c-b1bb-b3cb9f1c6afd");
