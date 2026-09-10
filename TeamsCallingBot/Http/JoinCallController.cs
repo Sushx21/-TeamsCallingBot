@@ -16,6 +16,8 @@ namespace TeamsCallingBot.Http
     /// 
     /// Each call runs independently up to BotOptions.MaxConcurrentCalls (default 10).
     /// </summary>
+    [Route("")]
+    [Route("/")]
     [Route("api/testjoin")]
     [Route("api/join")]
     [Route("api/calling/join")]
@@ -32,12 +34,77 @@ namespace TeamsCallingBot.Http
             this.registry = registry;
         }
 
-        [HttpPost]
-        public async Task<IActionResult> JoinAsync([FromBody] JoinCallRequest request)
+        [HttpGet]
+        public IActionResult Health()
         {
+            return this.Ok(new
+            {
+                success = true,
+                status = "Healthy",
+                service = "TeamsCallingBot",
+                botName = "TDA SECY",
+                message = "Calling Bot VM is active and listening. Ready to join meetings.",
+                activeCalls = this.bot.CallHandlers.Count,
+                defaultMeetingUrl = this.bot.Options?.TestMeetingJoinUrl
+            });
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> JoinAsync()
+        {
+            JoinCallRequest request = null;
+
+            try
+            {
+                if (this.Request.HasFormContentType && this.Request.Form != null)
+                {
+                    request = new JoinCallRequest
+                    {
+                        MeetingLink = this.Request.Form["meetingLink"].FirstOrDefault() ?? this.Request.Form["MeetingJoinUrl"].FirstOrDefault() ?? this.Request.Form["meetingUrl"].FirstOrDefault() ?? this.Request.Form["url"].FirstOrDefault(),
+                        MeetingId = this.Request.Form["meetingId"].FirstOrDefault(),
+                        Token = this.Request.Form["token"].FirstOrDefault() ?? this.Request.Form["bearerToken"].FirstOrDefault() ?? this.Request.Form["overrideBearerToken"].FirstOrDefault(),
+                        Prompt = this.Request.Form["prompt"].FirstOrDefault(),
+                        UserAdid = this.Request.Form["userAdid"].FirstOrDefault() ?? this.Request.Form["adid"].FirstOrDefault()
+                    };
+                }
+                else
+                {
+                    using (var reader = new System.IO.StreamReader(this.Request.Body, System.Text.Encoding.UTF8, true, 1024, true))
+                    {
+                        var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(body))
+                        {
+                            try
+                            {
+                                request = Newtonsoft.Json.JsonConvert.DeserializeObject<JoinCallRequest>(body);
+                            }
+                            catch
+                            {
+                                if (body.Trim().StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    request = new JoinCallRequest { MeetingLink = body.Trim() };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($">>> [JoinCallController] Note parsing incoming payload: {ex.Message}");
+            }
+
             if (request == null)
             {
-                return this.BadRequest(new { success = false, error = "Request body is required.", message = "Request body is required." });
+                request = new JoinCallRequest();
+            }
+
+            if (string.IsNullOrWhiteSpace(request.MeetingLink) && this.Request.Query != null)
+            {
+                request.MeetingLink = this.Request.Query["meetingLink"].FirstOrDefault()
+                    ?? this.Request.Query["MeetingJoinUrl"].FirstOrDefault()
+                    ?? this.Request.Query["meetingUrl"].FirstOrDefault()
+                    ?? this.Request.Query["url"].FirstOrDefault();
             }
 
             var effectiveUserAdid = !string.IsNullOrWhiteSpace(request.UserAdid) ? request.UserAdid : request.Adid;
