@@ -192,6 +192,35 @@ namespace TeamsCallingBot.Http
                 return this.StatusCode(500, new { error = ex.Message, joinUrl = parsed.JoinUrl });
             }
         }
+
+        /// <summary>
+        /// Registers a meeting mapping in the local table placeholder.
+        /// Allows mapping a short passcode link, meeting ID, or custom key to the real 19:meeting_...@thread.v2 URL or threadId.
+        /// </summary>
+        [HttpPost("map")]
+        [HttpPost("/api/meetings/map")]
+        public IActionResult RegisterMapping([FromBody] MeetingMappingRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.Key) || string.IsNullOrWhiteSpace(request.MeetingUrlOrThreadId))
+            {
+                return this.BadRequest(new { error = "Key and MeetingUrlOrThreadId are required." });
+            }
+
+            Common.MeetingLinkResolver.RegisterTableMapping(request.Key, request.MeetingUrlOrThreadId);
+            return this.Ok(new
+            {
+                success = true,
+                message = "Meeting mapping registered in table successfully.",
+                key = request.Key,
+                mappedTarget = request.MeetingUrlOrThreadId
+            });
+        }
+    }
+
+    public class MeetingMappingRequest
+    {
+        public string Key { get; set; }
+        public string MeetingUrlOrThreadId { get; set; }
     }
 
     public class JoinCallRequest

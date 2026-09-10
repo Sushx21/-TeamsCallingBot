@@ -145,16 +145,40 @@ namespace TeamsCallingBot.Bot
                 throw new ArgumentNullException(nameof(meetingJoinUrl));
             }
 
+            // 1. Resolve via Unified MeetingLinkResolver (auto-extract, direct 19 v2 threadId, table placeholder, short links)
+            var resolution = await Common.MeetingLinkResolver.ResolveAsync(meetingJoinUrl).ConfigureAwait(false);
+            if (!resolution.Success)
+            {
+                throw new ArgumentException(resolution.ErrorMessage ?? "Could not resolve meeting coordinates.", nameof(meetingJoinUrl));
+            }
+
+            // 2. Direct 19:meeting_...@thread.v2 match: join directly by coordinates!
+            if (resolution.IsDirectThreadId && !string.IsNullOrWhiteSpace(resolution.ThreadId))
+            {
+                this.graphLogger.Info($"[Join] Joining directly via 19 v2 threadId: {resolution.ThreadId} (Source: {resolution.Source})");
+                Console.WriteLine($">>> [Join] Joining directly via 19 v2 threadId: {resolution.ThreadId} (Source: {resolution.Source})");
+                return await this.JoinCallByCoordinatesAsync(
+                    resolution.ThreadId,
+                    null,
+                    null,
+                    recordVideo,
+                    resolution.ResolvedUrl ?? meetingJoinUrl,
+                    userAdid,
+                    transcriptFileName,
+                    prompt).ConfigureAwait(false);
+            }
+
+            string effectiveUrl = resolution.ResolvedUrl ?? meetingJoinUrl;
             ChatInfo chatInfo;
             MeetingInfo meetingInfo;
             string tenantId;
             try
             {
-                (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(meetingJoinUrl).ConfigureAwait(false);
+                (chatInfo, meetingInfo, tenantId) = await JoinInfo.ParseJoinURLAsync(effectiveUrl).ConfigureAwait(false);
             }
             catch (Exception parseEx)
             {
-                this.graphLogger.Error(parseEx, $"[Join] Could not parse the join URL - NOT attempting to join. URL: {meetingJoinUrl}");
+                this.graphLogger.Error(parseEx, $"[Join] Could not parse the join URL - NOT attempting to join. URL: {effectiveUrl}");
                 throw;
             }
 
@@ -164,7 +188,7 @@ namespace TeamsCallingBot.Bot
                 tenantId,
                 organizerId,
                 recordVideo,
-                meetingJoinUrl,
+                effectiveUrl,
                 userAdid,
                 transcriptFileName,
                 prompt).ConfigureAwait(false);

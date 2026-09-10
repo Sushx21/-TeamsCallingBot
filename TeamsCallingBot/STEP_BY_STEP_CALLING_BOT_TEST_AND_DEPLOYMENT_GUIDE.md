@@ -61,6 +61,42 @@
 
 ---
 
+## 🔗 The 4 Supported Meeting Link Formats & Database Table Placeholder
+
+The bot's [`MeetingLinkResolver`](file:///c:/Users/jaidevlalgame/Downloads/TeamsCallingBot/TeamsCallingBot/TeamsCallingBot/Common/MeetingLinkResolver.cs) now natively handles all four production formats:
+
+| Format | Input Example | How Bot Handles It |
+| :--- | :--- | :--- |
+| **1. Direct 19 v2 Thread ID** | `19:meeting_YmI0NWE3ZmEtOTBhOC...@thread.v2` | Joins directly via Graph SDK coordinate join without needing any URL wrapper. |
+| **2. Full System Reference URL** | `https://teams.microsoft.com/l/meetup-join/19%3ameeting_...@thread.v2/0?context={...}` | Auto-extracts threadId, tenantId, and organizerId locally with zero latency. |
+| **3. Passcode-Protected Short Link** | `https://teams.microsoft.com/meet/123456789?p=abcDEF` | Checks the Table Placeholder first; if found, maps straight to the `19 v2` link. Otherwise attempts HTTP unroll. |
+| **4. Auto-Extracted from Text/Email** | Forwarded email or message: *"Join Teams Meeting: https://..."* | Automatically regex-extracts the clean meeting URL out of raw surrounding text. |
+
+### 🗄️ Pluggable Table Lookup Placeholder (`QueryExternalMeetingTableAsync`)
+If you store meeting IDs and their corresponding `19:...@thread.v2` links in a BigQuery, SQL, or Firestore table, the bot provides two seamless ways to look them up:
+
+1. **In C# ([`Common/MeetingLinkResolver.cs`](file:///c:/Users/jaidevlalgame/Downloads/TeamsCallingBot/TeamsCallingBot/TeamsCallingBot/Common/MeetingLinkResolver.cs))**:
+   Fill in the placeholder method `QueryExternalMeetingTableAsync(meetingKey)` with your table query:
+   ```csharp
+   public static async Task<string> QueryExternalMeetingTableAsync(string meetingKey)
+   {
+       // PLACEHOLDER: Query your SQL / BigQuery table here:
+       // SELECT full_v2_url FROM my_meetings_table WHERE short_key = @meetingKey;
+       return await Task.FromResult<string>(null);
+   }
+   ```
+
+2. **Via Dynamic REST API (`POST /api/meetings/map`)**:
+   Register mappings at runtime without restarting the bot:
+   ```powershell
+   Invoke-RestMethod -Uri "http://localhost:8611/api/meetings/map" -Method Post -ContentType "application/json" -Body '{
+       "key": "123456789",
+       "meetingUrlOrThreadId": "19:meeting_YmI0NWE3ZmEtOTBhOC00MTRhLWI4YzctNjk3OGNlOGM5Zjg0@thread.v2"
+   }'
+   ```
+
+---
+
 ## 🖥️ Step 1: Start the Calling Bot on the VM
 
 1. Connect to your Windows VM (Local or Cloud).
