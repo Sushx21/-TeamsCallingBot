@@ -271,28 +271,32 @@ namespace TeamsCallingBot.Storage
         {
             if (string.IsNullOrWhiteSpace(input)) return "meeting_unknown";
 
+            // If it's a URL, URL-decode it first
+            try
+            {
+                input = System.Net.WebUtility.UrlDecode(input);
+            }
+            catch { }
+
             // Extract thread ID if full meetup-join URL is supplied
-            var match = Regex.Match(input, @"19%3ameeting_[a-zA-Z0-9_\-]+%40thread\.v2|19:meeting_[a-zA-Z0-9_\-]+@thread\.v2", RegexOptions.IgnoreCase);
+            var match = Regex.Match(input, @"19:[^/?#&]+@(thread\.v2|thread\.tacv2|unq\.gbl\.spaces)", RegexOptions.IgnoreCase);
             if (match.Success)
             {
                 input = match.Value;
             }
 
-            // Replace URL-encoded or invalid characters
-            string clean = input
-                .Replace("%3a", "_")
-                .Replace("%3A", "_")
-                .Replace("%40", "_")
-                .Replace(":", "_")
-                .Replace("@", "_")
-                .Replace("/", "_")
-                .Replace("?", "_")
-                .Replace("&", "_")
-                .Replace("=", "_");
-
-            if (clean.Length > 100)
+            // Replace characters that are invalid in Firestore doc IDs or URLs
+            var invalidChars = new[] { '/', '\\', '.', ':', '@', '?', '&', '=', '%', ' ', ';' };
+            var sb = new StringBuilder(input);
+            foreach (var ch in invalidChars)
             {
-                clean = clean.Substring(0, 100);
+                sb.Replace(ch, '_');
+            }
+
+            string clean = sb.ToString();
+            if (clean.Length > 120)
+            {
+                clean = clean.Substring(0, 120);
             }
 
             return clean;

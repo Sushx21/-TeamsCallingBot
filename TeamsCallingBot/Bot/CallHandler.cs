@@ -1672,14 +1672,102 @@ namespace TeamsCallingBot.Bot
             string text = System.Text.RegularExpressions.Regex.Replace(htmlContent, "<.*?>", string.Empty).Trim();
             if (string.IsNullOrWhiteSpace(text)) return;
 
-            string lower = text.ToLowerInvariant();
+            string lower = text.ToLowerInvariant().Trim();
             this.graphLogger.Info($"[Chat Monitor] Message from '{senderName}': {text}");
             Console.WriteLine($">>> [Chat Monitor] '{senderName}': {text}");
 
+            // 1. Manual Commands (#mute, #unmute, #leave, #photo, #speak, #status)
+            if (lower == "#mute" || lower == "!mute" || lower == "mute")
+            {
+                this.Mute();
+                _ = this.PostTextMessageToChatAsync("🔇 <b>Bot Audio Muted:</b> Audio output is now muted. (Still recording audio and video).");
+                return;
+            }
+
+            if (lower == "#unmute" || lower == "!unmute" || lower == "unmute")
+            {
+                this.Unmute();
+                _ = this.PostTextMessageToChatAsync("🔊 <b>Bot Audio Unmuted:</b> Audio output is now enabled.");
+                if (this.AudioSender != null)
+                {
+                    _ = this.AudioSender.SpeakAsync("I am now unmuted.");
+                }
+                return;
+            }
+
+            if (lower == "#leave" || lower == "!leave" || lower == "leave" || lower == "bot leave" || lower == "please leave")
+            {
+                _ = this.PostTextMessageToChatAsync("👋 <b>Leaving Meeting:</b> Finalizing session recordings, transcripts, and minutes of meeting...");
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(1500).ConfigureAwait(false);
+                        await this.Call.DeleteAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        this.graphLogger.Error(ex, "[Manual Command] Failed to leave call.");
+                    }
+                });
+                return;
+            }
+
+            if (lower == "#photo" || lower == "!photo" || lower == "#snapshot" || lower == "!snapshot" || lower == "photo")
+            {
+                var photo = this.CapturePhotoNow("chat");
+                if (photo != null)
+                {
+                    _ = this.PostTextMessageToChatAsync($"📸 <b>Snapshot Saved:</b> <code>{Path.GetFileName(photo)}</code>.");
+                }
+                else
+                {
+                    _ = this.PostTextMessageToChatAsync("⚠️ <b>Snapshot Notice:</b> No active screen share or video frame available right now.");
+                }
+                return;
+            }
+
+            if (lower.StartsWith("#speak ") || lower.StartsWith("!speak "))
+            {
+                string toSpeak = text.Substring(text.IndexOf(' ') + 1).Trim();
+                if (!string.IsNullOrWhiteSpace(toSpeak))
+                {
+                    if (this.AudioSender != null && !this.IsMuted)
+                    {
+                        _ = this.AudioSender.SpeakAsync(toSpeak);
+                        _ = this.PostTextMessageToChatAsync($"🗣️ <b>Spoken:</b> \"{System.Net.WebUtility.HtmlEncode(toSpeak)}\"");
+                    }
+                    else
+                    {
+                        _ = this.PostTextMessageToChatAsync("⚠️ <b>Cannot speak:</b> Bot audio is currently muted. Type <code>#unmute</code> first.");
+                    }
+                }
+                return;
+            }
+
+            if (lower == "#status" || lower == "!status" || lower == "status")
+            {
+                int humanCount = this.Call.Participants.Count(p =>
+                    p.Resource?.IsInLobby == false &&
+                    (p.Resource?.Info?.Identity?.Application == null || p.Resource.Info.Identity.Application.Id != this.options.AadAppId));
+
+                string statusHtml =
+                    $"📊 <b>Teams Calling Bot Status:</b><br/>" +
+                    $"• 🆔 Call ID: <code>{this.Call.Id}</code><br/>" +
+                    $"• 👥 Human Participants: <b>{humanCount}</b><br/>" +
+                    $"• 🎙️ Audio Output: <b>{(this.IsMuted ? "Muted" : "Active")}</b> (Listening: Active)<br/>" +
+                    $"• 📺 Screen Recording: <b>{(this.currentVbssMsi != 0 ? "Recording" : "Ready")}</b><br/>" +
+                    $"• 🤖 AI Assistant: <b>Online</b>";
+
+                _ = this.PostTextMessageToChatAsync(statusHtml);
+                return;
+            }
+
+            // 2. Conversational / Help Triggers
             bool isTrigger = lower.Contains("tda bot") || lower.Contains("tdabot") || lower.Contains("tda") ||
                              lower.Contains("kaise ho") || lower.Contains("kaisa ho") || lower.Contains("kaisa hai") ||
                              lower.Contains("hi bot") || lower.Contains("hello bot") || lower.Contains("hey bot") ||
-                             lower.Contains("status") || lower.Contains("help") || lower.Contains("recording");
+                             lower.Contains("help") || lower.Contains("recording");
 
             if (!isTrigger) return;
 
@@ -1691,15 +1779,17 @@ namespace TeamsCallingBot.Bot
                 replyHtml = $"🙏 <b>Namaste {System.Net.WebUtility.HtmlEncode(senderName)}!</b> Main badhiya hoon (I am doing well!). Main TDA Bot hoon, aapka AI meeting assistant. Aaj main aapki kya madad kar sakta hoon?";
                 spokenReply = $"Namaste {FirstName(senderName)}! Main badhiya hoon. How can I help you today?";
             }
-            else if (lower.Contains("status") || lower.Contains("recording"))
+            else if (lower.Contains("help") || lower.Contains("commands"))
             {
-                replyHtml = $"📊 <b>Teams Calling Bot Status:</b><br/>• 🎙️ Audio Recording: <b>Active</b><br/>• 📺 Screen Share Video Recording: <b>Active</b><br/>• 🤖 AI Assistant: <b>Online</b>";
-                spokenReply = "TDA Bot is active and recording audio and screen share.";
-            }
-            else if (lower.Contains("help"))
-            {
-                replyHtml = $"🤖 <b>TDA Bot Help:</b><br/>• Type <code>kaise ho</code> or <code>status</code> for greetings and status.<br/>• Ask TDA any question in chat or voice: <code>tda &lt;query&gt;</code>.<br/>• Audio, screen share video, and transcripts are automatically saved.";
-                spokenReply = "I am your AI meeting assistant. You can ask me questions or check recording status.";
+                replyHtml =
+                    $"🤖 <b>TDA Bot Commands:</b><br/>" +
+                    $"• <code>#status</code> - View current recording &amp; call status<br/>" +
+                    $"• <code>#mute</code> / <code>#unmute</code> - Mute/unmute bot audio output<br/>" +
+                    $"• <code>#photo</code> - Capture screen share snapshot<br/>" +
+                    $"• <code>#speak &lt;msg&gt;</code> - Speak text into the meeting<br/>" +
+                    $"• <code>#leave</code> - Instruct the bot to leave and finalize records<br/>" +
+                    $"• Type <code>kaise ho</code> for Hindi greetings, or ask any question!";
+                spokenReply = "Here are my commands. You can mute, unmute, take snapshots, ask questions, or ask me to leave.";
             }
             else
             {

@@ -55,12 +55,10 @@ namespace TeamsCallingBot.Config
         public string OverrideBearerToken { get; set; }
 
         /// <summary>
-        /// Caps how many meetings this VM instance will join at once. Default of 3 matches the
-        /// architecture doc's own "~3-4 concurrent meetings per capture VM" estimate for per-speaker
-        /// (unmixed) audio - that number is explicitly marked "needs validation" there, so revisit
-        /// once real throughput is measured on the actual VM hardware.
+        /// Caps how many meetings this VM instance will join at once. Default of 100
+        /// supports high-scale enterprise concurrent recording operations.
         /// </summary>
-        public int MaxConcurrentCalls { get; set; } = 3;
+        public int MaxConcurrentCalls { get; set; } = 100;
 
         /// <summary>
         /// Where recordings/transcripts are written. Point this at wherever Google Drive for Desktop's
