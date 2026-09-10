@@ -51,6 +51,9 @@ User simply types:
 `@AI #joincall` directly in the Teams meeting chat.
 - Action: Automatically extract the meeting thread ID from `context.activity.conversation.id` or `context.activity.channelData.meeting`.
 - Extract the `19:meeting_...thread.v2` ID and resolve the join URL using the Microsoft Graph Calendar/OnlineMeeting API or thread reference.
+- **Pre-Configured Fallback**: The Windows Calling Bot VM has your active test meeting URL pre-configured in its memory:
+  `https://teams.microsoft.com/l/meetup-join/19%3ameeting_MTYyMjU2YWUtODY3Zi00ZDJlLWEyMzItMTU3ZDg5YWQ5Mjhl%40thread.v2/0?context=%7b%22Tid%22%3a%22f35425af-4755-4e0c-b1bb-b3cb9f1c6afd%22%2c%22Oid%22%3a%22dc42a5b4-348d-483a-b362-7548d54e6bdb%22%7d`
+  If `meetingLink` is omitted or empty when typing `@AI #joincall`, the Calling Bot automatically joins this meeting!
 
 ---
 
