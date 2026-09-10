@@ -23,10 +23,12 @@ namespace TeamsCallingBot.Http
     public class JoinCallController : Controller
     {
         private readonly TeamsCallingBot.Bot.Bot bot;
+        private readonly Common.MeetingRegistryService registry;
 
-        public JoinCallController(TeamsCallingBot.Bot.Bot bot)
+        public JoinCallController(TeamsCallingBot.Bot.Bot bot, Common.MeetingRegistryService registry = null)
         {
             this.bot = bot;
+            this.registry = registry;
         }
 
         [HttpPost]
@@ -37,6 +39,14 @@ namespace TeamsCallingBot.Http
                 return this.BadRequest(new { success = false, error = "Request body is required.", message = "Request body is required." });
             }
 
+            var effectiveUserAdid = !string.IsNullOrWhiteSpace(request.UserAdid) ? request.UserAdid : request.Adid;
+
+            // Auto-register meetingId <-> meetingLink in local table resolver so any short-key or manual join can find it
+            if (!string.IsNullOrWhiteSpace(request.MeetingId) && !string.IsNullOrWhiteSpace(request.MeetingLink))
+            {
+                Common.MeetingLinkResolver.RegisterTableMapping(request.MeetingId, request.MeetingLink);
+            }
+
             var urls = new List<string>();
 
             if (request.MeetingJoinUrls != null && request.MeetingJoinUrls.Count > 0)
@@ -44,9 +54,13 @@ namespace TeamsCallingBot.Http
                 urls.AddRange(request.MeetingJoinUrls.Where(u => !string.IsNullOrWhiteSpace(u)).Select(u => u.Trim()));
             }
 
-            var singleInputUrl = !string.IsNullOrWhiteSpace(request.MeetingUrl)
-                ? request.MeetingUrl
-                : request.MeetingJoinUrl;
+            var singleInputUrl = !string.IsNullOrWhiteSpace(request.MeetingLink)
+                ? request.MeetingLink
+                : (!string.IsNullOrWhiteSpace(request.MeetingUrl)
+                    ? request.MeetingUrl
+                    : (!string.IsNullOrWhiteSpace(request.MeetingJoinUrl)
+                        ? request.MeetingJoinUrl
+                        : request.MeetingId));
 
             if (!string.IsNullOrWhiteSpace(singleInputUrl))
             {
@@ -61,7 +75,36 @@ namespace TeamsCallingBot.Http
 
             if (urls.Count == 0)
             {
-                return this.BadRequest(new { success = false, error = "At least one meetingUrl or MeetingJoinUrl is required.", message = "At least one meetingUrl or MeetingJoinUrl is required." });
+                return this.BadRequest(new { success = false, error = "At least one meetingLink, meetingUrl, or meetingId is required.", message = "At least one meetingLink, meetingUrl, or meetingId is required." });
+            }
+
+            var effectivePrompt = !string.IsNullOrWhiteSpace(request.Prompt)
+                ? request.Prompt
+                : (!string.IsNullOrWhiteSpace(request.MeetingName) ? $"Meeting name: {request.MeetingName}" : null);
+
+            // If scheduled in the future (> 2 mins away), register with scheduler
+            if (this.registry != null && request.MeetingStartTime.HasValue && request.MeetingStartTime.Value > DateTime.UtcNow.AddMinutes(2))
+            {
+                var registered = this.registry.Register(
+                    singleInputUrl,
+                    request.MeetingName ?? request.Subject,
+                    request.MeetingStartTime.Value.ToUniversalTime(),
+                    request.MeetingEndTime?.ToUniversalTime(),
+                    effectiveUserAdid,
+                    request.RecordVideo,
+                    request.MeetingId,
+                    "TableSync");
+
+                return this.Ok(new
+                {
+                    success = true,
+                    status = "Scheduled",
+                    meetingId = request.MeetingId,
+                    meetingLink = singleInputUrl,
+                    meetingName = request.MeetingName,
+                    scheduledStartTimeUtc = registered.ScheduledStartTimeUtc,
+                    message = $"Meeting '{request.MeetingName}' registered in scheduler. Will auto-join at scheduled time ({registered.ScheduledStartTimeUtc:u})."
+                });
             }
 
             // Single URL case (for direct compatibility with teamsBot.js and API callers)
@@ -73,9 +116,9 @@ namespace TeamsCallingBot.Http
                     var call = await this.bot.JoinCallAsync(
                         singleUrl,
                         request.RecordVideo,
-                        request.UserAdid,
+                        effectiveUserAdid,
                         request.TranscriptFileName,
-                        request.Prompt).ConfigureAwait(false);
+                        effectivePrompt).ConfigureAwait(false);
 
                     if (call == null)
                     {
@@ -95,7 +138,7 @@ namespace TeamsCallingBot.Http
                         status = "CallCreated",
                         callId = call.Id,
                         meetingUrl = singleUrl,
-                        userAdid = request.UserAdid,
+                        userAdid = effectiveUserAdid,
                         transcriptfilename = request.TranscriptFileName,
                         message = "AI Meeting Assistant joined the call successfully."
                     });
@@ -215,6 +258,103 @@ namespace TeamsCallingBot.Http
                 mappedTarget = request.MeetingUrlOrThreadId
             });
         }
+
+        /// <summary>
+        /// Production endpoint for syncing one or multiple meetings directly from your database / BigQuery table.
+        /// Accepts a single meeting JSON record or an array of meeting records.
+        /// </summary>
+        [HttpPost("table")]
+        [HttpPost("/api/meetings/table")]
+        public async Task<IActionResult> TableSyncAsync([FromBody] Newtonsoft.Json.Linq.JToken token)
+        {
+            if (token == null)
+            {
+                return this.BadRequest(new { error = "Request body is required." });
+            }
+
+            var requests = new List<JoinCallRequest>();
+            if (token.Type == Newtonsoft.Json.Linq.JTokenType.Array)
+            {
+                requests = token.ToObject<List<JoinCallRequest>>();
+            }
+            else if (token.Type == Newtonsoft.Json.Linq.JTokenType.Object)
+            {
+                requests.Add(token.ToObject<JoinCallRequest>());
+            }
+
+            if (requests.Count == 0)
+            {
+                return this.BadRequest(new { error = "No valid meeting records found in request." });
+            }
+
+            var results = new List<object>();
+            foreach (var req in requests)
+            {
+                var effectiveAdid = !string.IsNullOrWhiteSpace(req.UserAdid) ? req.UserAdid : req.Adid;
+                var urlOrId = !string.IsNullOrWhiteSpace(req.MeetingLink)
+                    ? req.MeetingLink
+                    : (!string.IsNullOrWhiteSpace(req.MeetingUrl) ? req.MeetingUrl : req.MeetingId);
+
+                if (!string.IsNullOrWhiteSpace(req.MeetingId) && !string.IsNullOrWhiteSpace(req.MeetingLink))
+                {
+                    Common.MeetingLinkResolver.RegisterTableMapping(req.MeetingId, req.MeetingLink);
+                }
+
+                if (this.registry != null && req.MeetingStartTime.HasValue && req.MeetingStartTime.Value > DateTime.UtcNow.AddMinutes(2))
+                {
+                    var registered = this.registry.Register(
+                        urlOrId,
+                        req.MeetingName ?? req.Subject,
+                        req.MeetingStartTime.Value.ToUniversalTime(),
+                        req.MeetingEndTime?.ToUniversalTime(),
+                        effectiveAdid,
+                        req.RecordVideo,
+                        req.MeetingId,
+                        "TableSync");
+
+                    results.Add(new
+                    {
+                        meetingId = req.MeetingId,
+                        meetingName = req.MeetingName ?? req.Subject,
+                        status = "Scheduled",
+                        scheduledStartTimeUtc = registered.ScheduledStartTimeUtc
+                    });
+                }
+                else
+                {
+                    try
+                    {
+                        var prompt = !string.IsNullOrWhiteSpace(req.Prompt) ? req.Prompt : (!string.IsNullOrWhiteSpace(req.MeetingName) ? $"Meeting name: {req.MeetingName}" : null);
+                        var call = await this.bot.JoinCallAsync(urlOrId, req.RecordVideo, effectiveAdid, req.TranscriptFileName, prompt).ConfigureAwait(false);
+                        results.Add(new
+                        {
+                            meetingId = req.MeetingId,
+                            meetingName = req.MeetingName ?? req.Subject,
+                            status = call != null ? "CallCreated" : "AlreadyJoinedOrLocked",
+                            callId = call?.Id
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        results.Add(new
+                        {
+                            meetingId = req.MeetingId,
+                            meetingName = req.MeetingName ?? req.Subject,
+                            status = "Failed",
+                            error = ex.Message
+                        });
+                    }
+                }
+            }
+
+            return this.Ok(new
+            {
+                success = true,
+                message = $"Processed {results.Count} table record(s) successfully.",
+                count = results.Count,
+                results = results
+            });
+        }
     }
 
     public class MeetingMappingRequest
@@ -241,6 +381,58 @@ namespace TeamsCallingBot.Http
         public string Prompt { get; set; }
 
         public bool RecordVideo { get; set; } = true;
+
+        // --- Production Table Schema Support ---
+        [Newtonsoft.Json.JsonProperty("adid")]
+        public string Adid { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingId")]
+        public string MeetingId { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingLink")]
+        public string MeetingLink { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingName")]
+        public string MeetingName { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingStartTime")]
+        public DateTime? MeetingStartTime { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("meetingEndTime")]
+        public DateTime? MeetingEndTime { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("eventId")]
+        public string EventId { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("dialInMeetingId")]
+        public string DialInMeetingId { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("joinMeetingId")]
+        public string JoinMeetingId { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("joinPasscode")]
+        public string JoinPasscode { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("isRecurring")]
+        public bool? IsRecurring { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("jobStatus")]
+        public string JobStatus { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("organizerEmail")]
+        public string OrganizerEmail { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("organizerUpn")]
+        public string OrganizerUpn { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("organizerUserId")]
+        public string OrganizerUserId { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("subject")]
+        public string Subject { get; set; }
+
+        [Newtonsoft.Json.JsonProperty("threadId")]
+        public string ThreadId { get; set; }
     }
 
     public class ForwardedInviteRequest
